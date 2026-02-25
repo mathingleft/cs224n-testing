@@ -23,8 +23,8 @@ def setup():
     for entry in dataset:
         if ((entry["formal_proof"]) != None and len(entry["formal_proof"]) > 0):
             data.append(entry)
-    import json                                                                                                    
-    with open("/vol/data/gemini_verified_proofs.json", "w") as f:                                                  
+    import json
+    with open("/vol/data/gemini_verified_proofs.json", "w") as f:
         json.dump(data, f, indent=2)  
     snapshot_download(repo_id="Qwen/Qwen2.5-3B", local_dir="/vol/models/base")
     vol.commit()
