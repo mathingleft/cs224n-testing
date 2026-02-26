@@ -9,7 +9,7 @@ image = (
     .uv_pip_install("huggingface_hub", "datasets")
 )
 
-vol = modal.Volume.from_name("my-volume", create_if_missing=True)
+vol = modal.Volume.from_name("my-volume-1", create_if_missing=True)
 
 @app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol})
 def setup():
@@ -23,10 +23,10 @@ def setup():
     for entry in dataset:
         if ((entry["formal_proof"]) != None and len(entry["formal_proof"]) > 0):
             data.append(entry)
-    import json
-    with open("/vol/data/gemini_verified_proofs.json", "w") as f:
-        json.dump(data, f, indent=2)  
-    snapshot_download(repo_id="Qwen/Qwen2.5-3B", local_dir="/vol/models/base")
+    #import json
+    #with open("/vol/data/Numina_proofs.json", "w") as f:
+    #    json.dump(data, f, indent=2)  
+    snapshot_download(repo_id="Qwen/Qwen3-4B", local_dir="/vol/models/Qwen3-4B/base")
     vol.commit()
 
 @app.local_entrypoint()
