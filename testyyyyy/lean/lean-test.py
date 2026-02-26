@@ -2,7 +2,7 @@ import modal
 import subprocess
 
 app = modal.App(name="lean-test")
-image = modal.Image.from_dockerfile("testing-lean/lean_dockerfile", add_python="3.13")
+image = modal.Image.from_dockerfile("testing-lean/lean.dockerfile", add_python="3.13")
 
 TESTS = [
     ("trivial true", "import Mathlib\n\nexample : True := trivial\n", True),

@@ -23,9 +23,9 @@ def setup():
     for entry in dataset:
         if ((entry["formal_proof"]) != None and len(entry["formal_proof"]) > 0):
             data.append(entry)
-    #import json
-    #with open("/vol/data/Numina_proofs.json", "w") as f:
-    #    json.dump(data, f, indent=2)  
+    import json
+    with open("/vol/data/Numina_proofs.json", "w") as f:
+        json.dump(data, f, indent=2)
     snapshot_download(repo_id="Qwen/Qwen3-4B", local_dir="/vol/models/Qwen3-4B/base")
     vol.commit()
 

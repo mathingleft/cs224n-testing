@@ -4,27 +4,38 @@ import sys
 app = modal.App(name="sdft")
 image = (
     #modal.Image.from_dockerfile("vanilla-sdft/Dockerfile.lean", add_python="3.13")
-    modal.Image.from_dockerfile("lean/lean_dockerfile", add_python="3.13")
-    .uv_pip_install("huggingface_hub", "datasets", "transformers", "torch", "accelerate", "bitsandbytes")
+    modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
+    .uv_pip_install("huggingface_hub", "datasets", "transformers", "torch", "accelerate", "bitsandbytes", "peft")
 )
 
 vol = modal.Volume.from_name("my-volume-1")
 
-@app.function(gpu="A100-80GB", image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=3600)
+@app.function(gpu="A100-80GB:2", image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=3600)
 def sdft():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from transformers import BitsAndBytesConfig
+    from peft import get_peft_model, LoraConfig, TaskType
     import random 
     import json
     import math
     import torch
     import torch.nn.functional as F
     torch.cuda.empty_cache()
-    qwen_model = "/vol/models/Qwen3-4B/base"
-    tokenizer = AutoTokenizer.from_pretrained(qwen_model)
-    student = AutoModelForCausalLM.from_pretrained(qwen_model, device_map="auto", torch_dtype="auto")
-    #teacher = AutoModelForCausalLM.from_pretrained(qwen_model, device_map="auto", torch_dtype="auto", quantization_config=BitsAndBytesConfig(load_in_8bit=True))
-    teacher = AutoModelForCausalLM.from_pretrained(qwen_model, device_map="auto", torch_dtype="auto")
+    model_type = "Goedel-Prover-SFT"
+    base_model = f"/vol/models/{model_type}/base"
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    student = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:0"}, torch_dtype="auto")
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+    )
+    student = get_peft_model(student, lora_config)
+    #teacher = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:1"}, torch_dtype="auto", quantization_config=BitsAndBytesConfig(load_in_8bit=True))
+    teacher = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:1"}, torch_dtype="auto")
     if (not tokenizer.pad_token):
         tokenizer.pad_token = tokenizer.eos_token
     data = json.load(open("/vol/data/Numina_proofs.json", "r"))
@@ -75,7 +86,7 @@ def sdft():
                 {entry["formal_statement"]}
             """
             teacher_input_ids = tokenizer(teacher_prompt, return_tensors="pt", padding=True).to(teacher.device)["input_ids"]
-            combined = torch.cat([teacher_input_ids, generated_tokens], dim=-1)
+            combined = torch.cat([teacher_input_ids, generated_tokens.to("cuda:1")], dim=-1)
             with torch.no_grad():
                 teacher_outputs = teacher(input_ids=combined)
             teacher_prompt_length = teacher_input_ids.shape[-1]
@@ -96,6 +107,7 @@ def sdft():
         import subprocess
         pass_count = 0
         timeout_count = 0
+        truncated_count = 0
         total = 0
         for k, entry in enumerate(val_data):
             input_ids = tokenizer(entry["formal_statement"], return_tensors="pt", padding=True).to(student.device)["input_ids"]
@@ -111,6 +123,7 @@ def sdft():
             if generated_tokens.shape[-1] == 0:
                 total += 1
                 continue
+            truncated = generated_tokens.shape[-1] >= max_new_tokens
 
             proof_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
             lean_code = f"import Mathlib\n\n{entry['formal_statement']}{proof_text}\n"
@@ -138,13 +151,17 @@ def sdft():
             elif timed_out:
                 status = "TIMEOUT"
                 timeout_count += 1
+            elif truncated:
+                status = "TRUNCATED"
+                truncated_count += 1
             else:
                 status = "FAIL"
             total += 1
 
             print(f"  Val [{k+1}/{len(val_data)}] {status}: {entry['formal_statement'][:60]}", flush=True)
-        print(f"Epoch {i} Val: {pass_count} PASS, {timeout_count} TIMEOUT, {total-pass_count-timeout_count} FAIL / {total} ({100*pass_count/max(total,1):.1f}%)", flush=True)
+        fail_count = total - pass_count - timeout_count - truncated_count
+        print(f"Epoch {i} Val: {pass_count} PASS, {timeout_count} TIMEOUT, {truncated_count} TRUNCATED, {fail_count} FAIL / {total} ({100*pass_count/max(total,1):.1f}%)", flush=True)
         student.train()
-        student.save_pretrained(f"/vol/models/vanilla-sdft/run1/epoch-{i}")
-        tokenizer.save_pretrained(f"/vol/models/vanilla-sdft/run1/epoch-{i}")
+        student.save_pretrained(f"/vol/models/{model_type}/run1/epoch-{i}")
+        tokenizer.save_pretrained(f"/vol/models/{model_type}/run1/epoch-{i}")
 

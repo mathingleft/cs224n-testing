@@ -3,7 +3,7 @@ import modal
 app = modal.App(name="gemini-lean")
 
 image = (
-    modal.Image.from_dockerfile("lean/lean_dockerfile", add_python="3.13")
+    modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
     .uv_pip_install("google-genai", "datasets")
 )
 
