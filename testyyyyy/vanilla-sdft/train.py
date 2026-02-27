@@ -7,22 +7,39 @@ image = (
     modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
     .uv_pip_install("huggingface_hub", "datasets", "transformers", "torch", "accelerate", "bitsandbytes", "peft")
 )
-
 vol = modal.Volume.from_name("my-volume-1")
+
+MODEL = "Goedel-Prover-SFT"
+DATA_FILE = "Numina_proofs.json"
+RUN_NAME = "run1"
+
+N_EXAMPLES = 50       # how many entries to use from the data file
+TRAIN_SPLIT = 0.9     # fraction used for training; remainder is validation
+N_EPOCHS = 5
+MAX_NEW_TOKENS = 600
+TEMPERATURE = 1.0
+LR = 1e-5
+
+# "full_file": formal_statement is a complete Lean file (Numina style) —
+#              already has imports, set_option, /- comment -/, ends with sorry.
+#              Strip sorry before feeding to the model; no PREAMBLE prepended.
+# "theorem":   formal_statement is just the theorem signature (MiniF2F style) —
+#              needs PREAMBLE prepended.
+DATA_FORMAT = "full_file"
+# DATA_FORMAT = "theorem"
 
 @app.function(gpu="A100-80GB:2", image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=3600)
 def sdft():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from transformers import BitsAndBytesConfig
     from peft import get_peft_model, LoraConfig, TaskType
-    import random 
+    import random
     import json
     import math
     import torch
     import torch.nn.functional as F
     torch.cuda.empty_cache()
-    model_type = "Goedel-Prover-SFT"
-    base_model = f"/vol/models/{model_type}/base"
+    base_model = f"/vol/models/{MODEL}/base"
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     student = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:0"}, torch_dtype="auto")
     lora_config = LoraConfig(
@@ -38,22 +55,32 @@ def sdft():
     teacher = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:1"}, torch_dtype="auto")
     if (not tokenizer.pad_token):
         tokenizer.pad_token = tokenizer.eos_token
-    data = json.load(open("/vol/data/Numina_proofs.json", "r"))
-    data = data[:50]
+    data = json.load(open(f"/vol/data/{DATA_FILE}", "r"))
+    data = data[:N_EXAMPLES]
     random.shuffle(data)
-    split = int(0.9 * len(data))
+    split = int(TRAIN_SPLIT * len(data))
     train_data = data[:split]
     val_data = data[split:]
-    batch_size = math.ceil(len(train_data) / 5)
-    max_new_tokens = 600
-    temperature = 1.0
-    optimizer = torch.optim.AdamW(student.parameters(), lr=1e-5) 
-    for i in range(5):
+    batch_size = math.ceil(len(train_data) / N_EPOCHS)
+    PREAMBLE = (
+        "import Mathlib\n"
+        "import Aesop\n\n"
+        "set_option maxHeartbeats 400000\n\n"
+        "open BigOperators Real Nat Topology Rat\n\n"
+    )
+    optimizer = torch.optim.AdamW(student.parameters(), lr=LR)
+    for i in range(N_EPOCHS):
         batch = train_data[i*batch_size:min((i+1)*batch_size,len(train_data)-1)]
         for j, entry in enumerate(batch):
             print(f"Epoch {i}, Example {j+1}/{len(batch)}", flush=True)
-            student_prompt = entry["formal_statement"]
-            student_input_ids = tokenizer(student_prompt, return_tensors="pt", padding=True).to(student.device)["input_ids"]
+            if DATA_FORMAT == "full_file":
+                student_prompt = entry["formal_statement"].rstrip()
+                if student_prompt.endswith("sorry"):
+                    student_prompt = student_prompt[:-5].rstrip()
+            else:
+                student_prompt = PREAMBLE + entry["formal_statement"]
+            student_inputs = tokenizer(student_prompt, return_tensors="pt", padding=True).to(student.device)
+            student_input_ids = student_inputs["input_ids"]
             student_prompt_length = student_input_ids.shape[-1]
 
             # generate tokens WITHOUT gradients (speed opt, is this scuffed)
@@ -61,9 +88,11 @@ def sdft():
             with torch.no_grad():
                 generated = student.generate(
                     student_input_ids,
-                    max_new_tokens=max_new_tokens,
+                    attention_mask=student_inputs["attention_mask"],
+                    max_new_tokens=MAX_NEW_TOKENS,
                     do_sample=True,
-                    temperature=temperature,
+                    temperature=TEMPERATURE,
+                    pad_token_id=tokenizer.eos_token_id,
                 )
             student.train()
             generated_tokens = generated[:, student_prompt_length:]
@@ -94,7 +123,7 @@ def sdft():
 
             # Step 4: KL divergence loss
             student_logs = F.log_softmax(student_logits, dim=-1)
-            teacher_logs = F.log_softmax(teacher_logits, dim=-1)
+            teacher_logs = F.log_softmax(teacher_logits.to("cuda:0"), dim=-1)
 
             loss = F.kl_div(student_logs, teacher_logs, log_target=True, reduction="sum") / student_response_length
             loss.backward()
@@ -110,23 +139,37 @@ def sdft():
         truncated_count = 0
         total = 0
         for k, entry in enumerate(val_data):
-            input_ids = tokenizer(entry["formal_statement"], return_tensors="pt", padding=True).to(student.device)["input_ids"]
+            if DATA_FORMAT == "full_file":
+                prompt = entry["formal_statement"].rstrip()
+                if prompt.endswith("sorry"):
+                    prompt = prompt[:-5].rstrip()
+            else:
+                prompt = PREAMBLE + entry["formal_statement"]
+            inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(student.device)
+            input_ids = inputs["input_ids"]
             length = input_ids.shape[-1]
             with torch.no_grad():
                 generated = student.generate(
                     input_ids,
-                    max_new_tokens=max_new_tokens,
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=MAX_NEW_TOKENS,
                     do_sample=True,
-                    temperature=temperature,
+                    temperature=TEMPERATURE,
+                    pad_token_id=tokenizer.eos_token_id,
                 )
             generated_tokens = generated[:, length:]
             if generated_tokens.shape[-1] == 0:
                 total += 1
                 continue
-            truncated = generated_tokens.shape[-1] >= max_new_tokens
+            truncated = generated_tokens.shape[-1] >= MAX_NEW_TOKENS
 
             proof_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-            lean_code = f"import Mathlib\n\n{entry['formal_statement']}{proof_text}\n"
+            if "```" in proof_text:
+                proof_text = proof_text[:proof_text.rfind("```")].rstrip()
+            if DATA_FORMAT == "full_file":
+                lean_code = prompt + proof_text + "\n"
+            else:
+                lean_code = PREAMBLE + entry["formal_statement"] + proof_text + "\n"
             with open("/vol/debug_1.txt", "a") as f:
                 f.write(f"[VALIDATION] Student generation: {lean_code}\n")
             with open("/lean-checker/LeanChecker/Test.lean", "w") as f:
@@ -162,6 +205,6 @@ def sdft():
         fail_count = total - pass_count - timeout_count - truncated_count
         print(f"Epoch {i} Val: {pass_count} PASS, {timeout_count} TIMEOUT, {truncated_count} TRUNCATED, {fail_count} FAIL / {total} ({100*pass_count/max(total,1):.1f}%)", flush=True)
         student.train()
-        student.save_pretrained(f"/vol/models/{model_type}/run1/epoch-{i}")
-        tokenizer.save_pretrained(f"/vol/models/{model_type}/run1/epoch-{i}")
+        student.save_pretrained(f"/vol/models/{MODEL}/{RUN_NAME}/epoch-{i}")
+        tokenizer.save_pretrained(f"/vol/models/{MODEL}/{RUN_NAME}/epoch-{i}")
 
