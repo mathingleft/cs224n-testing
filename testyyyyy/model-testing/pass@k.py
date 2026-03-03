@@ -1,6 +1,4 @@
 import modal
-import collections
-import os
 
 app = modal.App(name="pass-at-k")
 
@@ -10,11 +8,11 @@ vol = modal.Volume.from_name("my-volume-1")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_MODEL  = "Goedel-Prover-SFT"
-ADAPTER     = "Goedel-Prover-SFT/run2/epoch-19"  # None → base model
+ADAPTER     = None #"Goedel-Prover-SFT/run4/epoch-9"  # None → base model
 VOLUME_FILE = "MiniF2F_train.json"
 COLUMN      = "formal_statement"
 
-N_EXAMPLES    = 10
+N_EXAMPLES    = 16
 OFFSET        = 0      # start index into VOLUME_FILE (ignored when RANDOM_SEED is set)
 RANDOM_SEED   = 42     # set to None to use OFFSET instead of random sampling
 K             = 4      # proof attempts per problem  (K=1 → greedy)
@@ -25,7 +23,7 @@ MAX_NEW_TOKENS = 2048
 # "theorem":   MiniF2F-style — prepend PREAMBLE
 DATA_FORMAT = "theorem"
 
-RUN_NAME = "Goedel-run2-epoch19-minif2f-0"   # results saved to /vol/results/{RUN_NAME}/
+RUN_NAME = "Goedel-base-minif2f-0"   # results saved to /vol/results/{RUN_NAME}/
 # ─────────────────────────────────────────────────────────────────────────────
 
 PREAMBLE = (
@@ -133,10 +131,10 @@ def generate_proofs():
             print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(generated_tokens)} tokens", flush=True)
 
     # Save generated proofs to volume so they can be inspected later
+    import os
     os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
     with open(f"/vol/results/{RUN_NAME}/proofs.json", "w") as f:
-        import json as _json
-        _json.dump({"config": CONFIG, "jobs": jobs}, f, indent=2)
+        json.dump({"config": CONFIG, "jobs": jobs}, f, indent=2)
     vol.commit()
     print(f"Saved {len(jobs)} proofs → /vol/results/{RUN_NAME}/proofs.json", flush=True)
     return jobs
@@ -162,7 +160,7 @@ def verify_proof(job):
             cwd="/lean-checker",
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
         compiles = result.returncode == 0
         timed_out = False
@@ -185,34 +183,20 @@ def verify_proof(job):
     return {**job, "status": status, "error": first_error}
 
 
-# ── Stage 3: save results to volume ──────────────────────────────────────────
+# ── Stage 3: verify + aggregate + save in one in-flight function ──────────────
+# Combining these avoids the ConflictError from calling .remote() on a stopped
+# app: this function is already in-flight when the client might disconnect, so
+# it will complete (including the save) even if the local client drops.
 @app.function(
     image=lean_image,
     volumes={"/vol": vol},
-    timeout=60,
+    timeout=1800,
 )
-def save_results(results):
-    import json, os
-    os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
-    with open(f"/vol/results/{RUN_NAME}/results.json", "w") as f:
-        json.dump({"config": CONFIG, "results": results}, f, indent=2)
-    vol.commit()
-    print(f"Saved results → /vol/results/{RUN_NAME}/results.json", flush=True)
+def verify_and_save(jobs):
+    import json, os, collections
 
-
-# ── Entrypoint ────────────────────────────────────────────────────────────────
-@app.local_entrypoint()
-def main():
-    # 1. Generate all proofs on GPU
-    print("Generating proofs on GPU…")
-    jobs = generate_proofs.remote()
-    print(f"Generated {len(jobs)} proofs ({N_EXAMPLES} problems × {K} samples)")
-
-    # 2. Verify all proofs in parallel on CPU containers
-    print("Verifying proofs in parallel on CPU…")
     results = list(verify_proof.map(jobs))
 
-    # 3. Compute pass@k — problem passes if ANY of its K samples compiles
     by_example = collections.defaultdict(list)
     for r in results:
         by_example[r["example_idx"]].append(r)
@@ -223,11 +207,37 @@ def main():
         passed = "PASS" in statuses
         if passed:
             pass_count += 1
-        print(f"  example {idx}: {statuses} {'PASS' if passed else 'FAIL'}")
+        print(f"  example {idx}: {statuses} {'PASS' if passed else 'FAIL'}", flush=True)
 
     total = len(by_example)
     model_label = results[0]["model_label"] if results else "unknown"
-    print(f"\npass@{K} [{model_label}]: {pass_count}/{total} ({100*pass_count/max(total,1):.1f}%)")
+    print(f"\npass@{K} [{model_label}]: {pass_count}/{total} ({100*pass_count/max(total,1):.1f}%)", flush=True)
 
-    # 4. Persist results to volume
-    save_results.remote(results)
+    summary = {
+        "model_label": model_label,
+        "pass_at_k": K,
+        "pass_count": pass_count,
+        "total": total,
+        "pass_rate": round(pass_count / max(total, 1), 4),
+    }
+
+    os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
+    with open(f"/vol/results/{RUN_NAME}/results.json", "w") as f:
+        json.dump({"summary": summary, "config": CONFIG, "results": results}, f, indent=2)
+    vol.commit()
+    print(f"Saved → /vol/results/{RUN_NAME}/results.json", flush=True)
+    return summary
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+@app.local_entrypoint()
+def main():
+    # 1. Generate all proofs on GPU
+    print("Generating proofs on GPU…")
+    jobs = generate_proofs.remote()
+    print(f"Generated {len(jobs)} proofs ({N_EXAMPLES} problems × {K} samples)")
+
+    # 2. Verify in parallel, aggregate, and save — all server-side
+    print("Verifying proofs in parallel on CPU…")
+    summary = verify_and_save.remote(jobs)
+    print(f"\nFinal: pass@{summary['pass_at_k']} = {summary['pass_count']}/{summary['total']} ({100*summary['pass_rate']:.1f}%)")
