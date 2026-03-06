@@ -24,7 +24,7 @@ BATCH_SIZE = 10
 
 @app.function(
     image=lean_image,   # no GPU needed
-    timeout=300,        # per-proof timeout (includes 120 s Lean timeout + overhead)
+    timeout=600,        # per-proof timeout (includes 120 s Lean timeout + overhead)
 )
 def verify(lean_code):
     with open("/lean-checker/LeanChecker/Test.lean", "w") as f:
@@ -56,7 +56,7 @@ def verify(lean_code):
     first_error = lean_out.split("\n")[0] if lean_out else None
     return {"status": status, "error": first_error}
 
-@app.function(gpu="H100-80GB:2", image=gpu_image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=21600)
+@app.function(gpu="H100:2", image=gpu_image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=21600)
 def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
     import time
     import re
