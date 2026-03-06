@@ -3,14 +3,14 @@ import collections
 
 app = modal.App(name="compare-pass-at-k")
 
-lean_image = modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
-gpu_image = lean_image.uv_pip_install("transformers", "torch", "accelerate", "peft")
+lean_image = modal.Image.from_dockerfile("lean/lean_nocuda.dockerfile", add_python="3.13")
+gpu_image = lean_image.apt_install("gcc").uv_pip_install("transformers", "torch", "accelerate", "peft", "vllm")
 vol = modal.Volume.from_name("my-volume-1")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 K             = 4
 TEMPERATURE   = 0.9
-MAX_NEW_TOKENS = 2048
+MAX_NEW_TOKENS = 32768
 DATA_FORMAT   = "theorem"
 COLUMN        = "formal_statement"
 VOLUME_FILE   = "MiniF2F_train.json"
@@ -26,79 +26,119 @@ PREAMBLE = (
 
 # ── Stage 1: generate K proofs per problem on GPU ────────────────────────────
 @app.function(
-    gpu="A100-80GB",
+    gpu="H100",
     image=gpu_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={"/vol": vol},
-    timeout=3600,
+    timeout=36000,
 )
-def generate_proofs(model_path: str, n_examples: int):
-    import json, torch, random
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
+def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
+    import json, random
+    import os
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
+    from transformers import AutoTokenizer
 
     # Determine base model name and whether to load an adapter
-    parts = model_path.strip("/").split("/")
-    base_name = parts[0]
+    parts = BASE_MODEL.strip("/").split("/")
+    base_name = f"{parts[0]}/{parts[1]}"
     base_path = f"/vol/models/{base_name}/base"
-    use_adapter = not model_path.rstrip("/").endswith("/base")
-    adapter_path = f"/vol/models/{model_path}" if use_adapter else None
+    use_adapter = not BASE_MODEL.rstrip("/").endswith("/base")
+    adapter_path = f"/vol/models/{BASE_MODEL}" if use_adapter else None
 
-    tokenizer = AutoTokenizer.from_pretrained(base_path)
-    model = AutoModelForCausalLM.from_pretrained(base_path, device_map="auto", torch_dtype="auto")
-    if adapter_path is not None:
-        model = PeftModel.from_pretrained(model, adapter_path)
+    tokenizer = AutoTokenizer.from_pretrained(base_path, local_files_only=True)
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_label = model_path
-
+    model_label = BASE_MODEL
     data = json.load(open(f"/vol/data/{VOLUME_FILE}"))
-    rng = random.Random(RANDOM_SEED)
-    indices = rng.sample(range(len(data)), n_examples)
-    indices.sort()
+    if N_EXAMPLES > 0:
+        rng = random.Random(RANDOM_SEED)
+        indices = rng.sample(range(len(data)), N_EXAMPLES)
+        indices.sort()
+    else:
+        indices = list(range(len(data)))
     examples = [(idx, data[idx]) for idx in indices]
-    print(f"[{model_label}] Random sample (seed={RANDOM_SEED}): indices {indices}", flush=True)
-
-    jobs = []
+    print(f"Random sample (seed={RANDOM_SEED}): indices {indices}", flush=True)
+    # else:
+    #     examples = [(OFFSET + i, data[OFFSET + i]) for i in range(N_EXAMPLES)]
+    
+    # Build all prompts
+    is_goedel = "Goedel" in BASE_MODEL
+    prompts = []
+    raw_prompts = []  # the lean code portion (for reconstructing lean_code later)
+    metadata = []  # track (example_index_in_list, idx, statement, entry) per prompt
+    ejected = 0
     for i, (idx, entry) in enumerate(examples):
         statement = entry[COLUMN].strip()
         if DATA_FORMAT == "full_file":
-            prompt = statement.rstrip()
-            if prompt.endswith("sorry"):
-                prompt = prompt[:-5].rstrip()
+            raw_prompt = statement.rstrip()
+            if raw_prompt.endswith("sorry"):
+                raw_prompt = raw_prompt[:-5].rstrip()
         else:
-            prompt = PREAMBLE + statement
+            raw_prompt = PREAMBLE + statement
 
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
-        input_ids = inputs["input_ids"]
-        length = input_ids.shape[-1]
-
-        for k in range(K):
-            gen_kwargs = dict(
-                input_ids=input_ids,
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=(K > 1),
-                pad_token_id=tokenizer.eos_token_id,
+        if is_goedel:
+            user_msg = (
+                f"Complete the following Lean 4 code:\n\n"
+                f"```lean4\n{raw_prompt}\n```\n\n"
+                f"Before producing the Lean 4 code to formally prove the given theorem, "
+                f"provide a detailed proof plan outlining the main proof steps and strategies.\n"
+                f"The plan should highlight key ideas, intermediate lemmas, and proof structures "
+                f"that will guide the construction of the final formal proof."
             )
-            if K > 1:
-                gen_kwargs["temperature"] = TEMPERATURE
+            chat = [{"role": "user", "content": user_msg}]
+            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+        else:
+            prompt = raw_prompt
 
-            with torch.no_grad():
-                generated = model.generate(**gen_kwargs)
+        prompts.append(prompt)
+        raw_prompts.append(raw_prompt)
+        metadata.append((i, idx, statement, entry))
+    print(f"Ejected {ejected}")
+    print(f"Built {len(prompts)} prompts from {len(examples)} examples", flush=True)
+    for pi, p in enumerate(prompts):
+        print(f"  prompt[{pi}]: {len(p)} chars, first 100: {p[:100]!r}", flush=True)
 
-            generated_tokens = generated[0, length:]
-            truncated = generated_tokens.shape[-1] >= MAX_NEW_TOKENS
-            proof_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            if "```" in proof_text:
-                proof_text = proof_text[:proof_text.rfind("```")].rstrip()
+    # Load model and generate all rollouts in one batched call
+    llm = LLM(
+        model=base_path, dtype="auto", gpu_memory_utilization=0.90, enforce_eager=True,
+        enable_lora=use_adapter, max_lora_rank=16, max_model_len=MAX_NEW_TOKENS + 2048,
+    )
+    stop_tokens = ["<|im_end|>"] if is_goedel else ["```"]
+    sampling_params = SamplingParams(
+        n=K,
+        temperature=TEMPERATURE if K > 1 else 0,
+        max_tokens=MAX_NEW_TOKENS,
+        stop=stop_tokens,
+    )
+    lora_request = LoRARequest("adapter", 1, adapter_path) if use_adapter else None
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+    print(f"vLLM returned {len(outputs)} outputs, each with {[len(o.outputs) for o in outputs]} completions", flush=True)
+    # save generated proofs to volume so they can be inspected later
+    # os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
+    # Post-process outputs
+    jobs = []
+    for raw_prompt, (i, idx, statement, entry), request_output in zip(raw_prompts, metadata, outputs):
+        for k, completion in enumerate(request_output.outputs):
+            proof_text = completion.text
+            truncated = len(completion.token_ids) >= MAX_NEW_TOKENS
 
-            if DATA_FORMAT == "full_file":
-                lean_code = prompt + proof_text + "\n"
+            if is_goedel:
+                # Goedel outputs a proof plan then a ```lean4\n...\n``` code block
+                # Extract the last code block as the actual proof
+                import re
+                code_blocks = re.findall(r"```lean4?\n(.*?)```", proof_text, re.DOTALL)
+                if code_blocks:
+                    lean_code = code_blocks[-1].strip() + "\n"
+                else:
+                    # Fallback: no code block found, use raw output
+                    lean_code = proof_text + "\n"
+            elif DATA_FORMAT == "full_file":
+                lean_code = raw_prompt + proof_text + "\n"
             else:
                 lean_code = PREAMBLE + statement + proof_text + "\n"
-
+            lean_code = PREAMBLE + lean_code 
             jobs.append({
                 "example_idx": idx,
                 "sample_idx": k,
@@ -107,9 +147,98 @@ def generate_proofs(model_path: str, n_examples: int):
                 "truncated": truncated,
                 "model_label": model_label,
             })
-            print(f"  [{model_label}] example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(generated_tokens)} tokens", flush=True)
-
+            print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(completion.token_ids)} tokens", flush=True)
+        
+        # with open(f"/vol/results/{RUN_NAME}/_{idx}_proofs.json", "w") as f:
+        #     json.dump({"config": CONFIG, "jobs": jobs}, f, indent=2)
+        # vol.commit()
+        # print(f"Saved {len(jobs)} proofs → /vol/results/{RUN_NAME}/_{idx}_proofs.json", flush=True)
     return jobs
+# @app.function(
+#     gpu="A100-80GB",
+#     image=gpu_image,
+#     secrets=[modal.Secret.from_name("huggingface-secret")],
+#     volumes={"/vol": vol},
+#     timeout=3600,
+# )
+# def generate_proofs(model_path: str, n_examples: int):
+#     import json, torch, random
+#     from transformers import AutoModelForCausalLM, AutoTokenizer
+#     from peft import PeftModel
+
+#     # Determine base model name and whether to load an adapter
+#     parts = model_path.strip("/").split("/")
+#     base_name = parts[0]
+#     base_path = f"/vol/models/{base_name}/base"
+#     use_adapter = not model_path.rstrip("/").endswith("/base")
+#     adapter_path = f"/vol/models/{model_path}" if use_adapter else None
+
+#     tokenizer = AutoTokenizer.from_pretrained(f"/vol/models/{model_path}")
+#     model = AutoModelForCausalLM.from_pretrained(f"/vol/models/{model_path}", device_map="auto", torch_dtype="auto")
+#     if adapter_path is not None:
+#         model = PeftModel.from_pretrained(model, adapter_path)
+#     if not tokenizer.pad_token:
+#         tokenizer.pad_token = tokenizer.eos_token
+
+#     model_label = model_path
+
+#     data = json.load(open(f"/vol/data/{VOLUME_FILE}"))
+#     rng = random.Random(RANDOM_SEED)
+#     indices = rng.sample(range(len(data)), n_examples)
+#     indices.sort()
+#     examples = [(idx, data[idx]) for idx in indices]
+#     print(f"[{model_label}] Random sample (seed={RANDOM_SEED}): indices {indices}", flush=True)
+
+#     jobs = []
+#     for i, (idx, entry) in enumerate(examples):
+#         statement = entry[COLUMN].strip()
+#         if DATA_FORMAT == "full_file":
+#             prompt = statement.rstrip()
+#             if prompt.endswith("sorry"):
+#                 prompt = prompt[:-5].rstrip()
+#         else:
+#             prompt = PREAMBLE + statement
+
+#         inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
+#         input_ids = inputs["input_ids"]
+#         length = input_ids.shape[-1]
+
+#         for k in range(K):
+#             gen_kwargs = dict(
+#                 input_ids=input_ids,
+#                 attention_mask=inputs["attention_mask"],
+#                 max_new_tokens=MAX_NEW_TOKENS,
+#                 do_sample=(K > 1),
+#                 pad_token_id=tokenizer.eos_token_id,
+#             )
+#             if K > 1:
+#                 gen_kwargs["temperature"] = TEMPERATURE
+
+#             with torch.no_grad():
+#                 generated = model.generate(**gen_kwargs)
+
+#             generated_tokens = generated[0, length:]
+#             truncated = generated_tokens.shape[-1] >= MAX_NEW_TOKENS
+#             proof_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+#             if "```" in proof_text:
+#                 proof_text = proof_text[:proof_text.rfind("```")].rstrip()
+
+#             if DATA_FORMAT == "full_file":
+#                 lean_code = prompt + proof_text + "\n"
+#             else:
+#                 lean_code = PREAMBLE + statement + proof_text + "\n"
+
+#             jobs.append({
+#                 "example_idx": idx,
+#                 "sample_idx": k,
+#                 "statement": statement,
+#                 "lean_code": lean_code,
+#                 "truncated": truncated,
+#                 "model_label": model_label,
+#             })
+#             print(f"  [{model_label}] example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(generated_tokens)} tokens", flush=True)
+
+#     return jobs
 
 
 # ── Stage 2: verify a single proof on CPU (mapped in parallel) ───────────────
