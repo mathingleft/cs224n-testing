@@ -8,11 +8,6 @@ image = (
 )
 vol = modal.Volume.from_name("my-volume-1")
 
-MODEL = "Kimina-Prover-Preview-Distill-7B"
-DATA_FILE = "Numina_proofs.json"
-RUN_NAME = "run_sdft"
-
-TRAIN_INDICES = [3, 5]   # indices in DATA_FILE the base model fails on
 N_EPOCHS = 20
 MAX_NEW_TOKENS = 600
 TEMPERATURE = 0.7
@@ -21,14 +16,15 @@ LR = 1e-5
 DATA_FORMAT = "full_file"
 
 @app.function(gpu="A100-80GB:2", image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=3600)
-def sdft():
+def sdft(model: str, sample_size: int, dataset: str, run_name: str):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import get_peft_model, LoraConfig, TaskType
     import json
+    import random
     import torch
     import torch.nn.functional as F
     torch.cuda.empty_cache()
-    base_model = f"/vol/models/{MODEL}/base"
+    base_model = f"/vol/models/{model}/base"
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     student = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:0"}, torch_dtype="auto")
     lora_config = LoraConfig(
@@ -43,8 +39,12 @@ def sdft():
     teacher = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:1"}, torch_dtype="auto")
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
-    data = json.load(open(f"/vol/data/{DATA_FILE}", "r"))
-    train_data = [data[i] for i in TRAIN_INDICES]
+    data = json.load(open(f"/vol/data/{dataset}", "r"))
+    rng = random.Random(42)
+    indices = rng.sample(range(len(data)), sample_size)
+    indices.sort()
+    train_data = [data[i] for i in indices]
+    print(f"Random sample (seed=42): {len(train_data)} examples, indices {indices}", flush=True)
     PREAMBLE = (
         "import Mathlib\n"
         "import Aesop\n\n"
@@ -107,9 +107,14 @@ def sdft():
             optimizer.zero_grad()
             print(f"  loss: {loss.item():.4f}, generated {student_response_length} tokens", flush=True)
 
-        student.save_pretrained(f"/vol/models/{MODEL}/{RUN_NAME}/epoch-{i}")
-        tokenizer.save_pretrained(f"/vol/models/{MODEL}/{RUN_NAME}/epoch-{i}")
+        student.save_pretrained(f"/vol/models/{model}/{run_name}/epoch-{i}")
+        tokenizer.save_pretrained(f"/vol/models/{model}/{run_name}/epoch-{i}")
 
 @app.local_entrypoint()
-def main():
-    sdft.remote()
+def main(
+    model: str = "Kimina-Prover-Preview-Distill-7B",
+    sample_size: int = 10,
+    dataset: str = "Numina_proofs.json",
+    run_name: str = "run_sdft",
+):
+    sdft.remote(model, sample_size, dataset, run_name)

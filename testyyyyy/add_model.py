@@ -9,12 +9,12 @@ image = (
         #"datasets"
     )
 )
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-1", create_if_missing=True)
 
-REPO_ID = "AI-MO/Kimina-Prover-Preview-Distill-7B"
-LOCAL_DIR = "/vol/models/Kimina-Prover-Preview-Distill-7B/base"
+REPO_ID = "Goedel-LM/Goedel-Prover-V2-8B"
+LOCAL_DIR = "/vol/models/Goedel-LM/Goedel-Prover-V2-8B/base"
 
-@app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol})
+@app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=3600)
 def setup():
     from huggingface_hub import snapshot_download
     import os

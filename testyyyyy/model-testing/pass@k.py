@@ -82,7 +82,7 @@ def generate_proofs():
         print(f"Random sample (seed={RANDOM_SEED}): indices {indices}", flush=True)
     else:
         examples = [(OFFSET + i, data[OFFSET + i]) for i in range(N_EXAMPLES)]
-
+    
     jobs = []
     for i, (idx, entry) in enumerate(examples):
         statement = entry[COLUMN].strip()
