@@ -244,7 +244,7 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
 # ── Stage 2: verify a single proof on CPU (mapped in parallel) ───────────────
 @app.function(
     image=lean_image,
-    timeout=300,
+    timeout=600,
 )
 def verify_proof(job):
     import subprocess
@@ -261,7 +261,7 @@ def verify_proof(job):
             cwd="/lean-checker",
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=300,
         )
         compiles = result.returncode == 0
         timed_out = False

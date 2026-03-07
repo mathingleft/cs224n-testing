@@ -29,7 +29,7 @@ def verify_proof(job):
             cwd="/lean-checker",
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
         compiles = result.returncode == 0
         timed_out = False
@@ -63,7 +63,7 @@ def save_results(path: str, data: dict):
 
 
 @app.local_entrypoint()
-def main(results_file: str = "results/compare_2/compare_results.json"):
+def main(results_file: str = "results/compare_3/compare_results.json"):
     # Download file from volume to a local temp path
     import io
     buf = io.BytesIO()
