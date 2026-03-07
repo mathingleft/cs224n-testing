@@ -3,12 +3,12 @@ import modal
 app = modal.App(name="pass-at-k")
 
 lean_image = modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
-gpu_image = lean_image.uv_pip_install("transformers", "torch", "accelerate", "peft")
+gpu_image = lean_image.uv_pip_install("vllm", "torch-c-dlpack-ext")
 vol = modal.Volume.from_name("my-volume-1")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_MODEL  = "Goedel-Prover-SFT"
-ADAPTER     = None #"Goedel-Prover-SFT/run4/epoch-9"  # None → base model
+BASE_MODEL  = "Goedel-Prover-V2-8B"
+ADAPTER     = None #"Goedel-Prover-V2-8B/T--GP-V2-32B--0/epoch-7"  # None → base model
 VOLUME_FILE = "MiniF2F_train.json"
 COLUMN      = "formal_statement"
 
@@ -23,7 +23,7 @@ MAX_NEW_TOKENS = 2048
 # "theorem":   MiniF2F-style — prepend PREAMBLE
 DATA_FORMAT = "theorem"
 
-RUN_NAME = "Goedel-base-minif2f-0"   # results saved to /vol/results/{RUN_NAME}/
+RUN_NAME = "GP-V2-8B--0"   # results saved to /vol/results/{RUN_NAME}/
 # ─────────────────────────────────────────────────────────────────────────────
 
 PREAMBLE = (
@@ -57,17 +57,13 @@ CONFIG = {
     timeout=3600,
 )
 def generate_proofs():
-    import json, torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
+    import json
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
 
     base_path = f"/vol/models/{BASE_MODEL}/base"
-    tokenizer = AutoTokenizer.from_pretrained(base_path)
-    model = AutoModelForCausalLM.from_pretrained(base_path, device_map="auto", torch_dtype="auto")
-    if ADAPTER is not None:
-        model = PeftModel.from_pretrained(model, f"/vol/models/{ADAPTER}")
-    if not tokenizer.pad_token:
-        tokenizer.pad_token = tokenizer.eos_token
+    llm = LLM(model=base_path, dtype="auto", enable_lora=(ADAPTER is not None))
+    lora_request = LoRARequest("adapter", 1, f"/vol/models/{ADAPTER}") if ADAPTER is not None else None
 
     model_label = ADAPTER if ADAPTER is not None else BASE_MODEL
     import random
@@ -91,27 +87,16 @@ def generate_proofs():
         else:
             prompt = PREAMBLE + statement
 
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
-        input_ids = inputs["input_ids"]
-        length = input_ids.shape[-1]
+        sampling_params = SamplingParams(
+            n=K,
+            max_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE if K > 1 else 0,
+        )
+        outputs = llm.generate([prompt], sampling_params, lora_request=lora_request)
 
-        for k in range(K):
-            gen_kwargs = dict(
-                input_ids=input_ids,
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=(K > 1),
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            if K > 1:
-                gen_kwargs["temperature"] = TEMPERATURE
-
-            with torch.no_grad():
-                generated = model.generate(**gen_kwargs)
-
-            generated_tokens = generated[0, length:]
-            truncated = generated_tokens.shape[-1] >= MAX_NEW_TOKENS
-            proof_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        for k, completion in enumerate(outputs[0].outputs):
+            truncated = completion.finish_reason == "length"
+            proof_text = completion.text
             if "```" in proof_text:
                 proof_text = proof_text[:proof_text.rfind("```")].rstrip()
 
@@ -128,7 +113,7 @@ def generate_proofs():
                 "truncated": truncated,
                 "model_label": model_label,
             })
-            print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(generated_tokens)} tokens", flush=True)
+            print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(completion.token_ids)} tokens", flush=True)
 
     # Save generated proofs to volume so they can be inspected later
     import os

@@ -11,20 +11,22 @@ image = (
 )
 vol = modal.Volume.from_name("my-volume-1")
 
-DATASET_NAME = "Tonic/MiniF2F"
-SPLIT = "train"
-COLUMN = "formal_statement"
-FILE = "MiniF2F_train.json"
+DATASETS = [
+    # (dataset_name, split, column, file),
+    ("Tonic/MiniF2F", "train", "formal_statement", "MiniF2F_train.json"),
+]
 
 @app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol})
 def setup():
     from datasets import load_dataset
     import os, json
     os.makedirs("/vol/data", exist_ok=True)
-    dataset = load_dataset(DATASET_NAME, split=SPLIT)
-    data = [entry for entry in dataset if entry[COLUMN] is not None and len(entry[COLUMN]) > 0]
-    with open(f"/vol/data/{FILE}", "w") as f:
-        json.dump(data, f, indent=2)
+    for dataset_name, split, column, file in DATASETS:
+        print(f"Downloading {dataset_name}/{split} → {file}", flush=True)
+        dataset = load_dataset(dataset_name, split=split)
+        data = [entry for entry in dataset if entry[column] is not None and len(entry[column]) > 0]
+        with open(f"/vol/data/{file}", "w") as f:
+            json.dump(data, f, indent=2)
     vol.commit()
 
 @app.local_entrypoint()

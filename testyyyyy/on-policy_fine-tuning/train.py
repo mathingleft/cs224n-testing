@@ -1,21 +1,23 @@
 import modal
 import sys
 
-app = modal.App(name="sdft")
+app = modal.App(name="on-policy_fine-tuning")
 image = (
     modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
     .uv_pip_install("huggingface_hub", "datasets", "transformers", "torch", "accelerate", "bitsandbytes", "peft")
 )
 vol = modal.Volume.from_name("my-volume-1")
 
-MODEL = "Goedel-Prover-SFT"
+STUDENT_MODEL = "Kimina-Prover-Preview-Distill-7B"
+TEACHER_MODEL = "Goedel-Prover-V2-32B"
 DATA_FILE = "Numina_proofs.json"
-RUN_NAME = "run4"
+RUN_NAME = "T--GP-V2-32B--0"
 
-N_TRAIN     = 10         # number of examples to randomly sample
+N_TRAIN     = 10         # Is y the way we want the LLM to respond to x?number of examples to randomly sample
 RANDOM_SEED = 42         # set to None to use TRAIN_INDICES instead
 TRAIN_INDICES = [3, 5]   # used only when RANDOM_SEED is None
 N_EPOCHS = 10
+SAVE_EVERY = 1    # save checkpoint every N epochs (also always saves final epoch)
 MAX_NEW_TOKENS = 600
 TEMPERATURE = 0.7
 LR = 1e-5
@@ -30,7 +32,7 @@ def sdft():
     import torch
     import torch.nn.functional as F
     torch.cuda.empty_cache()
-    base_model = f"/vol/models/{MODEL}/base"
+    base_model = f"/vol/models/{STUDENT_MODEL}/base"
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     student = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:0"}, torch_dtype="auto")
     lora_config = LoraConfig(
@@ -42,7 +44,9 @@ def sdft():
         bias="none",
     )
     student = get_peft_model(student, lora_config)
-    teacher = AutoModelForCausalLM.from_pretrained(base_model, device_map={"": "cuda:1"}, torch_dtype="auto")
+    teacher = AutoModelForCausalLM.from_pretrained(
+        f"/vol/models/{TEACHER_MODEL}/base", device_map={"": "cuda:1"}, torch_dtype="auto",
+    )
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
     data = json.load(open(f"/vol/data/{DATA_FILE}", "r"))
@@ -116,8 +120,11 @@ def sdft():
             optimizer.zero_grad()
             print(f"  loss: {loss.item():.4f}, generated {student_response_length} tokens", flush=True)
 
-        student.save_pretrained(f"/vol/models/{MODEL}/{RUN_NAME}/epoch-{i}")
-        tokenizer.save_pretrained(f"/vol/models/{MODEL}/{RUN_NAME}/epoch-{i}")
+        if (i + 1) % SAVE_EVERY == 0 or i == N_EPOCHS - 1:
+            student.save_pretrained(f"/vol/models/{STUDENT_MODEL}/{RUN_NAME}/epoch-{i}")
+            tokenizer.save_pretrained(f"/vol/models/{STUDENT_MODEL}/{RUN_NAME}/epoch-{i}")
+            vol.commit()
+            print(f"  checkpoint saved → epoch-{i}", flush=True)
 
 @app.local_entrypoint()
 def main():

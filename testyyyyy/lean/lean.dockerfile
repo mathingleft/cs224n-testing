@@ -1,6 +1,6 @@
 FROM ubuntu:22.04
 
-RUN apt-get update && apt-get install -y curl git
+RUN apt-get update && apt-get install -y curl git build-essential
 
 # Install elan + stable Lean toolchain (provides lake)
 ENV ELAN_HOME="/root/.elan"
