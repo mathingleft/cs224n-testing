@@ -220,7 +220,7 @@ def distillation(model_name: str, data_file: str, run_name: str, sample_size: in
         student_response_length = response_ids.shape[-1]
 
         if student_response_length == 0:
-            return None, 0
+            return None, 0, None
 
         # redundant if teacher is on cuda:0, but kept for multi-GPU compatibility
         teacher_device = next(teacher.parameters()).device
@@ -243,9 +243,10 @@ def distillation(model_name: str, data_file: str, run_name: str, sample_size: in
         del student_logits, teacher_logs_cpu
         optimizer.zero_grad()
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=float("inf")).item()
         optimizer.step()
         torch.cuda.empty_cache()
-        return loss.item(), student_response_length
+        return loss.item(), student_response_length, grad_norm
 
     # ── Initialize vLLM on GPU 1 (student on GPU 0, teacher on GPUs 1+2) ────
     lora_dir = "/tmp/student_lora"
@@ -265,6 +266,7 @@ def distillation(model_name: str, data_file: str, run_name: str, sample_size: in
         random.shuffle(train_data)
         epoch_start = time.time()
         batch = train_data[:BATCH_SIZE]
+        epoch_records = []
 
         # Step 1: Build prompts
         all_prompts = [build_student_prompt(entry) for entry in batch]
@@ -303,9 +305,30 @@ def distillation(model_name: str, data_file: str, run_name: str, sample_size: in
 
             teacher_context = build_teacher_prompt(entry, all_prompts[j], verification, feedback=feedback)
             t0 = time.time()
-            loss_val, n_tokens = compute_loss_and_update(all_prompts[j], proof_text, teacher_context)
+            loss_val, n_tokens, grad_norm = compute_loss_and_update(all_prompts[j], proof_text, teacher_context)
             if loss_val is not None:
-                print(f"  [time] teacher+grad: {time.time()-t0:.1f}s | loss: {loss_val:.4f}, tokens: {n_tokens}", flush=True)
+                print(f"  [time] teacher+grad: {time.time()-t0:.1f}s | loss: {loss_val:.4f}, tokens: {n_tokens}, grad_norm: {grad_norm:.4f}", flush=True)
+
+            epoch_records.append({
+                "example_idx": j,
+                "formal_statement": entry.get("formal_statement", ""),
+                "formal_proof": entry.get("formal_proof", ""),
+                "student_response": proof_text,
+                "verification_status": verification["status"],
+                "verification_error": verification.get("error"),
+                "gemini_feedback": feedback,
+                "loss": loss_val,
+                "n_tokens": n_tokens,
+                "grad_norm": grad_norm,
+            })
+
+        t0 = time.time()
+        log_path = f"/vol/training_logs/{model_name}/{run_name}/epoch-{i}.json"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w") as f:
+            json.dump(epoch_records, f, indent=2)
+        vol.commit()
+        print(f"  [time] training log save: {time.time()-t0:.1f}s → {log_path}", flush=True)
 
         t0 = time.time()
         student.save_pretrained(f"/vol/models/{model_name}/{run_name}/epoch-{i}")
