@@ -270,8 +270,12 @@ def distillation(model_name: str, data_file: str, run_name: str, sample_size: in
         all_prompts = [build_student_prompt(entry) for entry in batch]
 
         # Step 2: Generate with vLLM (student weights)
+        t0 = time.time()
         student.save_pretrained(lora_dir)
+        print(f"  [time] lora save: {time.time()-t0:.1f}s", flush=True)
+        t0 = time.time()
         vllm_outputs = llm.generate(all_prompts, sampling_params, lora_request=LoRARequest("student", i + 1, lora_dir))
+        print(f"  [time] vllm generation: {time.time()-t0:.1f}s", flush=True)
 
         # Step 3: Extract proof texts and lean codes
         all_proof_texts, all_lean_codes = [], []
@@ -283,7 +287,9 @@ def distillation(model_name: str, data_file: str, run_name: str, sample_size: in
 
         # Step 4: Batch verification
         print(f"Verifying {len(all_lean_codes)} proofs in parallel...", flush=True)
+        t0 = time.time()
         all_verifications = list(verify.map(all_lean_codes))
+        print(f"  [time] verification: {time.time()-t0:.1f}s", flush=True)
 
         # Step 5: Per-example Gemini feedback + teacher scoring + gradient update
         for j, (entry, proof_text, verification) in enumerate(zip(batch, all_proof_texts, all_verifications)):
@@ -291,17 +297,21 @@ def distillation(model_name: str, data_file: str, run_name: str, sample_size: in
 
             feedback = None
             if use_gemini:
+                t0 = time.time()
                 feedback = get_gemini_feedback(entry, proof_text, verification)
-                print(f"  gemini feedback: {feedback[:120]}", flush=True)
+                print(f"  [time] gemini: {time.time()-t0:.1f}s | feedback: {feedback[:120]}", flush=True)
 
             teacher_context = build_teacher_prompt(entry, all_prompts[j], verification, feedback=feedback)
+            t0 = time.time()
             loss_val, n_tokens = compute_loss_and_update(all_prompts[j], proof_text, teacher_context)
             if loss_val is not None:
-                print(f"  loss: {loss_val:.4f}, generated {n_tokens} tokens", flush=True)
+                print(f"  [time] teacher+grad: {time.time()-t0:.1f}s | loss: {loss_val:.4f}, tokens: {n_tokens}", flush=True)
 
-        print(f"EPOCH {i} time: {time.time() - epoch_start}")
+        t0 = time.time()
         student.save_pretrained(f"/vol/models/{model_name}/{run_name}/epoch-{i}")
         tokenizer.save_pretrained(f"/vol/models/{model_name}/{run_name}/epoch-{i}")
+        print(f"  [time] checkpoint save: {time.time()-t0:.1f}s", flush=True)
+        print(f"EPOCH {i} time: {time.time() - epoch_start:.1f}s", flush=True)
 
     print(f"TIME: {time.time() - start}")
 
