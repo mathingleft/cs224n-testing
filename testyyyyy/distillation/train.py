@@ -16,7 +16,7 @@ vol = modal.Volume.from_name("my-volume-2")
 GCP_PROJECT = "cs-224n-project-488523"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 
-N_EPOCHS = 20
+N_EPOCHS = 1
 MAX_NEW_TOKENS = 32768
 TEMPERATURE = 0.7
 LR = 1e-5

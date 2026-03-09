@@ -5,6 +5,7 @@ app = modal.App(name="compare-pass-at-k")
 
 lean_image = modal.Image.from_dockerfile("lean/lean_nocuda.dockerfile", add_python="3.13")
 gpu_image = lean_image.apt_install("gcc").uv_pip_install("transformers", "torch", "accelerate", "peft", "vllm")
+orchestrate_image = modal.Image.debian_slim(python_version="3.11").pip_install("matplotlib")
 vol = modal.Volume.from_name("my-volume-2")
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -13,7 +14,7 @@ TEMPERATURE   = 0.9
 MAX_NEW_TOKENS = 32768
 DATA_FORMAT   = "theorem"
 COLUMN        = "formal_statement"
-VOLUME_FILE   = "MiniF2F_train.json"
+VOLUME_FILE   = "Numina_bad_50.json"
 RANDOM_SEED   = 42
 
 PREAMBLE = (
@@ -101,10 +102,13 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
         print(f"  prompt[{pi}]: {len(p)} chars, first 100: {p[:100]!r}", flush=True)
 
     # Load model and generate all rollouts in one batched call
+    import time as _time
+    t0 = _time.time()
     llm = LLM(
         model=base_path, dtype="auto", gpu_memory_utilization=0.90, enforce_eager=True,
         enable_lora=use_adapter, max_lora_rank=16, max_model_len=MAX_NEW_TOKENS + 2048,
     )
+    print(f"  [time] model load: {_time.time()-t0:.1f}s", flush=True)
     stop_tokens = ["<|im_end|>"] if is_goedel else ["```"]
     sampling_params = SamplingParams(
         n=K,
@@ -113,7 +117,9 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
         stop=stop_tokens,
     )
     lora_request = LoRARequest("adapter", 1, adapter_path) if use_adapter else None
+    t0 = _time.time()
     outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+    print(f"  [time] vllm generate ({len(prompts)} prompts × K={K}): {_time.time()-t0:.1f}s", flush=True)
     print(f"vLLM returned {len(outputs)} outputs, each with {[len(o.outputs) for o in outputs]} completions", flush=True)
     # save generated proofs to volume so they can be inspected later
     # os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
@@ -214,84 +220,34 @@ def save_results(run_name: str, all_results: dict):
     print(f"Saved results → /vol/results/{run_name}/compare_results.json", flush=True)
 
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
-@app.local_entrypoint()
-def main(models: str, run_name: str, sample_size: int = 5):
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def make_config(sample_size):
+    return {
+        "K": K, "SAMPLE_SIZE": sample_size, "TEMPERATURE": TEMPERATURE,
+        "MAX_NEW_TOKENS": MAX_NEW_TOKENS, "DATA_FORMAT": DATA_FORMAT,
+        "VOLUME_FILE": VOLUME_FILE, "RANDOM_SEED": RANDOM_SEED,
+    }
+
+def compute_pass_at_k(results):
+    by_example = collections.defaultdict(list)
+    for r in results:
+        by_example[r["example_idx"]].append(r)
+    pass_count = 0
+    for idx, samples in sorted(by_example.items()):
+        statuses = [s["status"] for s in samples]
+        passed = "PASS" in statuses
+        if passed:
+            pass_count += 1
+        print(f"  example {idx}: {statuses} {'PASS' if passed else 'FAIL'}")
+    total = len(by_example)
+    pct = 100 * pass_count / max(total, 1)
+    return pass_count, total, pct
+
+def plot_bar_chart(model_scores, run_name, out_path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
-    model_list = [m.strip() for m in models.split(",")]
-    print(f"Comparing {len(model_list)} models: {model_list}")
-
-    all_results = {}
-    model_scores = {}
-
-    for model_path in model_list:
-        # 1. Generate proofs on GPU
-        print(f"\n--- Generating proofs for: {model_path} ---")
-        jobs = generate_proofs.remote(model_path, sample_size)
-        print(f"Generated {len(jobs)} proofs ({sample_size} problems × {K} samples)")
-
-        # 2. Verify all proofs in parallel on CPU containers
-        print(f"Verifying proofs for: {model_path} ...")
-        results = list(verify_proof.map(jobs))
-
-        # 3. Compute pass@k
-        by_example = collections.defaultdict(list)
-        for r in results:
-            by_example[r["example_idx"]].append(r)
-
-        pass_count = 0
-        for idx, samples in sorted(by_example.items()):
-            statuses = [s["status"] for s in samples]
-            passed = "PASS" in statuses
-            if passed:
-                pass_count += 1
-            print(f"  example {idx}: {statuses} {'PASS' if passed else 'FAIL'}")
-
-        total = len(by_example)
-        pct = 100 * pass_count / max(total, 1)
-        print(f"pass@{K} [{model_path}]: {pass_count}/{total} ({pct:.1f}%)")
-
-        model_scores[model_path] = pct
-        all_results[model_path] = {
-            "pass_count": pass_count,
-            "total": total,
-            "pass_at_k_pct": pct,
-            "results": results,
-        }
-        save_results.remote(model_path, {
-            "config": {
-                "K": K,
-                "SAMPLE_SIZE": sample_size,
-                "TEMPERATURE": TEMPERATURE,
-                "MAX_NEW_TOKENS": MAX_NEW_TOKENS,
-                "DATA_FORMAT": DATA_FORMAT,
-                "VOLUME_FILE": VOLUME_FILE,
-                "RANDOM_SEED": RANDOM_SEED,
-            },
-            "models": [all_results[model_path]],
-        })
-
-    # 4. Save results to volume
-    save_results.remote(run_name, {
-        "config": {
-            "K": K,
-            "SAMPLE_SIZE": sample_size,
-            "TEMPERATURE": TEMPERATURE,
-            "MAX_NEW_TOKENS": MAX_NEW_TOKENS,
-            "DATA_FORMAT": DATA_FORMAT,
-            "VOLUME_FILE": VOLUME_FILE,
-            "RANDOM_SEED": RANDOM_SEED,
-        },
-        "models": all_results,
-    })
-
-    # 5. Generate bar graph
-    names = list(model_scores.keys())
-    scores = list(model_scores.values())
-
+    names, scores = list(model_scores.keys()), list(model_scores.values())
     fig, ax = plt.subplots(figsize=(max(6, len(names) * 2), 5))
     bars = ax.bar(range(len(names)), scores, color="steelblue")
     ax.set_xticks(range(len(names)))
@@ -299,12 +255,48 @@ def main(models: str, run_name: str, sample_size: int = 5):
     ax.set_ylabel(f"pass@{K} (%)")
     ax.set_title(f"pass@{K} Comparison ({run_name})")
     ax.set_ylim(0, max(scores + [10]) * 1.2)
-
     for bar, score in zip(bars, scores):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
                 f"{score:.1f}%", ha="center", va="bottom", fontsize=10)
-
     plt.tight_layout()
-    out_path = f"results/results_{run_name}.png"
     fig.savefig(out_path, dpi=150)
-    print(f"\nBar graph saved to {out_path}")
+    print(f"Bar graph saved to {out_path}")
+
+@app.function(image=orchestrate_image, volumes={"/vol": vol}, timeout=86400)
+def run_comparison(model_list: list, run_name: str, sample_size: int):
+    import os, time
+    all_results, model_scores = {}, {}
+    for model_path in model_list:
+        model_start = time.time()
+        print(f"\n--- Generating proofs for: {model_path} ---", flush=True)
+        t0 = time.time()
+        jobs = generate_proofs.remote(model_path, sample_size)
+        print(f"  [time] generate_proofs: {time.time()-t0:.1f}s ({len(jobs)} jobs)", flush=True)
+
+        t0 = time.time()
+        results = list(verify_proof.map(jobs))
+        print(f"  [time] verification: {time.time()-t0:.1f}s", flush=True)
+
+        pass_count, total, pct = compute_pass_at_k(results)
+        print(f"pass@{K} [{model_path}]: {pass_count}/{total} ({pct:.1f}%)", flush=True)
+
+        model_scores[model_path] = pct
+        all_results[model_path] = {"pass_count": pass_count, "total": total, "pass_at_k_pct": pct, "results": results}
+        save_results.remote(model_path, {"config": make_config(sample_size), "models": [all_results[model_path]]})
+        print(f"  [time] total for {model_path}: {time.time()-model_start:.1f}s", flush=True)
+
+    save_results.remote(run_name, {"config": make_config(sample_size), "models": all_results})
+
+    out_path = f"/vol/results/{run_name}/comparison.png"
+    os.makedirs(f"/vol/results/{run_name}", exist_ok=True)
+    plot_bar_chart(model_scores, run_name, out_path)
+    vol.commit()
+    print(f"Chart saved to volume: {out_path}", flush=True)
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+@app.local_entrypoint()
+def main(models: str, run_name: str, sample_size: int = 5):
+    model_list = [m.strip() for m in models.split(",")]
+    print(f"Comparing {len(model_list)} models: {model_list}")
+    run_comparison.remote(model_list, run_name, sample_size)
