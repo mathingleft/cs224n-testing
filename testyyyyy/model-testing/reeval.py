@@ -4,7 +4,7 @@ import collections
 
 app = modal.App(name="reeval-with-preamble")
 lean_image = modal.Image.from_dockerfile("lean/lean_nocuda.dockerfile", add_python="3.13")
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-2")
 
 PREAMBLE = (
     "import Mathlib\n"

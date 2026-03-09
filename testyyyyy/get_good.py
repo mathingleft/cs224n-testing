@@ -5,7 +5,7 @@ app = modal.App(name="data-gathering")
 image = (
     modal.Image.debian_slim(python_version="3.13")
 )
-vol = modal.Volume.from_name("my-volume-1", create_if_missing=True)
+vol = modal.Volume.from_name("my-volume-2", create_if_missing=True)
 
 @app.function(
     image=image,

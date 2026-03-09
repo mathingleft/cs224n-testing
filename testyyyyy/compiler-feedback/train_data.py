@@ -3,7 +3,7 @@ import sys
 import subprocess
 import random
 
-app = modal.App(name="sdft-targeted")
+app = modal.App(name="sdft+cf")
 lean_image = modal.Image.from_dockerfile("lean/lean_nocuda.dockerfile", add_python="3.13")
 
 gpu_image = (
@@ -12,7 +12,7 @@ gpu_image = (
     .pip_install("huggingface_hub", "datasets", "transformers", "torch", "accelerate", "bitsandbytes", "peft", "vllm")
     # .pip_install("flash-attn", extra_options="--no-build-isolation")
 )
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-2")
 
 N_EPOCHS = 20
 MAX_NEW_TOKENS = 32768
@@ -72,7 +72,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
     torch.cuda.empty_cache()
     base_model = f"/vol/models/{model_name}/base"
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True)
-    student = AutoModelForCausalLM.from_pretrained(base_model, local_files_only=True, device_map={"": "cuda:0"}, torch_dtype="auto")
+    student = AutoModelForCausalLM.from_pretrained(base_model, local_files_only=True, device_map={"": "cuda:0"}, dtype="auto")
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=16,
@@ -84,10 +84,9 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
     student = get_peft_model(student, lora_config)
     student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     student.enable_input_require_grads()
-    teacher = AutoModelForCausalLM.from_pretrained(base_model, local_files_only=True, device_map={"": "cuda:1"}, torch_dtype="auto")
+    teacher = AutoModelForCausalLM.from_pretrained(base_model, local_files_only=True, device_map={"": "cuda:1"}, dtype="auto")
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
-    # data = json.load(open(f"/vol/data/{data_file}", "r"))
     data = json.load(open(f"/vol/{data_file}", "r"))
     if sample_size > 0:
         train_data = random.sample(data, min(sample_size, len(data)))
@@ -243,6 +242,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
         student.save_pretrained(f"/vol/models/{model_name}/{run_name}/epoch-{i}")
         tokenizer.save_pretrained(f"/vol/models/{model_name}/{run_name}/epoch-{i}")
     print(f"TIME: {time.time() - start}")
+
 @app.local_entrypoint()
-def main(model: str, data: str, run_name: str, sample_size: int = 0):
-    sdft.remote(model, data, run_name, sample_size)
+def main(model: str, data_file: str, run_name: str, sample_size: int = 0):
+    sdft.remote(model, data_file, run_name, sample_size)

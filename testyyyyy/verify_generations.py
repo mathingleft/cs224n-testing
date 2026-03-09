@@ -4,7 +4,7 @@ import os
 app = modal.App(name="pass-at-k")
 
 lean_image = modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-2")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VOLUME_FILE = "Numina_proofs.json"

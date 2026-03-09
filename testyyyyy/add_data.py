@@ -9,7 +9,7 @@ image = (
         "datasets"
     )
 )
-vol = modal.Volume.from_name("my-volume-1", create_if_missing=True)
+vol = modal.Volume.from_name("my-volume-2", create_if_missing=True)
 
 DATASET_NAME = "AI-MO/NuminaMath-LEAN" #change to whatever dataset we're using
 SPLIT = "train"

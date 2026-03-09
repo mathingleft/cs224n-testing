@@ -10,8 +10,8 @@ gpu_image = (
     .apt_install("git")
     .pip_install("huggingface_hub", "datasets", "transformers", "torch", "accelerate", "bitsandbytes", "peft", "vllm")
     # .pip_install("flash-attn", extra_options="--no-build-isolation")
-  )
-vol = modal.Volume.from_name("my-volume-1")
+)
+vol = modal.Volume.from_name("my-volume-2")
 
 N_EPOCHS = 20
 MAX_NEW_TOKENS = 32768

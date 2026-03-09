@@ -9,17 +9,16 @@ image = (
         #"datasets"
     )
 )
-vol = modal.Volume.from_name("my-volume-1", create_if_missing=True)
+vol = modal.Volume.from_name("my-volume-2", create_if_missing=True)
 
-REPO_ID = "Goedel-LM/Goedel-Prover-V2-8B"
-LOCAL_DIR = "/vol/models/Goedel-LM/Goedel-Prover-V2-8B/base"
+REPO_ID = "Goedel-LM/Goedel-Prover-V2-32B"
 
-@app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=3600)
+@app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=10800)
 def setup():
     from huggingface_hub import snapshot_download
     import os
-    os.makedirs("/vol/data", exist_ok=True)
-    snapshot_download(repo_id=REPO_ID, local_dir=LOCAL_DIR)
+    os.makedirs("/vol/models", exist_ok=True)
+    snapshot_download(repo_id=REPO_ID, local_dir=f"/vol/models/{REPO_ID}/base")
     vol.commit()
 
 @app.local_entrypoint()

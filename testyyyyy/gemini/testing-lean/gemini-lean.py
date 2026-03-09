@@ -7,7 +7,7 @@ image = (
     .uv_pip_install("google-genai", "datasets")
 )
 
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-2")
 
 GCP_PROJECT = "cs-224n-project-488523"
 MODEL = "gemini-2.5-flash-lite"

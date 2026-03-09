@@ -5,7 +5,7 @@ app = modal.App(name="compare-pass-at-k")
 
 lean_image = modal.Image.from_dockerfile("lean/lean_nocuda.dockerfile", add_python="3.13")
 gpu_image = lean_image.apt_install("gcc").uv_pip_install("transformers", "torch", "accelerate", "peft", "vllm")
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-2")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 K             = 4
@@ -154,91 +154,6 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
         # vol.commit()
         # print(f"Saved {len(jobs)} proofs → /vol/results/{RUN_NAME}/_{idx}_proofs.json", flush=True)
     return jobs
-# @app.function(
-#     gpu="A100-80GB",
-#     image=gpu_image,
-#     secrets=[modal.Secret.from_name("huggingface-secret")],
-#     volumes={"/vol": vol},
-#     timeout=3600,
-# )
-# def generate_proofs(model_path: str, n_examples: int):
-#     import json, torch, random
-#     from transformers import AutoModelForCausalLM, AutoTokenizer
-#     from peft import PeftModel
-
-#     # Determine base model name and whether to load an adapter
-#     parts = model_path.strip("/").split("/")
-#     base_name = parts[0]
-#     base_path = f"/vol/models/{base_name}/base"
-#     use_adapter = not model_path.rstrip("/").endswith("/base")
-#     adapter_path = f"/vol/models/{model_path}" if use_adapter else None
-
-#     tokenizer = AutoTokenizer.from_pretrained(f"/vol/models/{model_path}")
-#     model = AutoModelForCausalLM.from_pretrained(f"/vol/models/{model_path}", device_map="auto", torch_dtype="auto")
-#     if adapter_path is not None:
-#         model = PeftModel.from_pretrained(model, adapter_path)
-#     if not tokenizer.pad_token:
-#         tokenizer.pad_token = tokenizer.eos_token
-
-#     model_label = model_path
-
-#     data = json.load(open(f"/vol/data/{VOLUME_FILE}"))
-#     rng = random.Random(RANDOM_SEED)
-#     indices = rng.sample(range(len(data)), n_examples)
-#     indices.sort()
-#     examples = [(idx, data[idx]) for idx in indices]
-#     print(f"[{model_label}] Random sample (seed={RANDOM_SEED}): indices {indices}", flush=True)
-
-#     jobs = []
-#     for i, (idx, entry) in enumerate(examples):
-#         statement = entry[COLUMN].strip()
-#         if DATA_FORMAT == "full_file":
-#             prompt = statement.rstrip()
-#             if prompt.endswith("sorry"):
-#                 prompt = prompt[:-5].rstrip()
-#         else:
-#             prompt = PREAMBLE + statement
-
-#         inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
-#         input_ids = inputs["input_ids"]
-#         length = input_ids.shape[-1]
-
-#         for k in range(K):
-#             gen_kwargs = dict(
-#                 input_ids=input_ids,
-#                 attention_mask=inputs["attention_mask"],
-#                 max_new_tokens=MAX_NEW_TOKENS,
-#                 do_sample=(K > 1),
-#                 pad_token_id=tokenizer.eos_token_id,
-#             )
-#             if K > 1:
-#                 gen_kwargs["temperature"] = TEMPERATURE
-
-#             with torch.no_grad():
-#                 generated = model.generate(**gen_kwargs)
-
-#             generated_tokens = generated[0, length:]
-#             truncated = generated_tokens.shape[-1] >= MAX_NEW_TOKENS
-#             proof_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-#             if "```" in proof_text:
-#                 proof_text = proof_text[:proof_text.rfind("```")].rstrip()
-
-#             if DATA_FORMAT == "full_file":
-#                 lean_code = prompt + proof_text + "\n"
-#             else:
-#                 lean_code = PREAMBLE + statement + proof_text + "\n"
-
-#             jobs.append({
-#                 "example_idx": idx,
-#                 "sample_idx": k,
-#                 "statement": statement,
-#                 "lean_code": lean_code,
-#                 "truncated": truncated,
-#                 "model_label": model_label,
-#             })
-#             print(f"  [{model_label}] example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(generated_tokens)} tokens", flush=True)
-
-#     return jobs
 
 
 # ── Stage 2: verify a single proof on CPU (mapped in parallel) ───────────────
@@ -301,7 +216,7 @@ def save_results(run_name: str, all_results: dict):
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
-def main(models: str, run_name: str = "comparison", sample_size: int = 5):
+def main(models: str, run_name: str, sample_size: int = 5):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -390,6 +305,6 @@ def main(models: str, run_name: str = "comparison", sample_size: int = 5):
                 f"{score:.1f}%", ha="center", va="bottom", fontsize=10)
 
     plt.tight_layout()
-    out_path = f"results_{run_name}.png"
+    out_path = f"results/results_{run_name}.png"
     fig.savefig(out_path, dpi=150)
     print(f"\nBar graph saved to {out_path}")

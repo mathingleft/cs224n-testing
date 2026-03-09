@@ -6,7 +6,7 @@ app = modal.App(name="pass-at-k")
 
 lean_image = modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
 gpu_image = lean_image.uv_pip_install("transformers", "torch", "accelerate", "peft")
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-2")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_MODEL  = "Goedel-Prover-SFT"

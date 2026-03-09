@@ -5,7 +5,7 @@ image = (
     modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
     .uv_pip_install("huggingface_hub", "datasets", "transformers", "torch", "accelerate", "bitsandbytes", "peft")
 )
-vol = modal.Volume.from_name("my-volume-1")
+vol = modal.Volume.from_name("my-volume-2")
 
 N_EPOCHS = 20
 LR = 1e-5
