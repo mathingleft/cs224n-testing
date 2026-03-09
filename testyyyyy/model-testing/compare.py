@@ -14,7 +14,7 @@ TEMPERATURE   = 0.9
 MAX_NEW_TOKENS = 32768
 DATA_FORMAT   = "theorem"
 COLUMN        = "formal_statement"
-VOLUME_FILE   = "Numina_bad_50.json"
+VOLUME_FILE   = "Numina_good_last40.json"
 RANDOM_SEED   = 42
 
 PREAMBLE = (
