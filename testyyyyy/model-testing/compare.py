@@ -146,6 +146,7 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
                 "lean_code": lean_code,
                 "truncated": truncated,
                 "model_label": model_label,
+                "generation_length": {len(completion.token_ids)}
             })
             print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(completion.token_ids)} tokens", flush=True)
         
@@ -248,6 +249,8 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
 )
 def verify_proof(job):
     import subprocess
+    import time
+    start = time.time()
 
     lean_code = job["lean_code"]
     truncated = job["truncated"]
@@ -281,7 +284,7 @@ def verify_proof(job):
         status = "FAIL"
 
     first_error = lean_out.split("\n")[0] if lean_out else None
-    return {**job, "status": status, "error": first_error}
+    return {**job, "status": status, "error": first_error, "ver_time": time.time() - start}
 
 
 # ── Stage 3: save results to volume ──────────────────────────────────────────
@@ -301,7 +304,7 @@ def save_results(run_name: str, all_results: dict):
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
-def main(models: str, run_name: str = "comparison", sample_size: int = 5):
+def main(models: str, run_name: str = "comparison", sample_size: int = 5, data: str = "MiniF2F_train.json"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -311,6 +314,8 @@ def main(models: str, run_name: str = "comparison", sample_size: int = 5):
 
     all_results = {}
     model_scores = {}
+
+    VOLUME_FILE = data
 
     for model_path in model_list:
         # 1. Generate proofs on GPU
