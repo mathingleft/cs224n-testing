@@ -11,10 +11,10 @@ vol = modal.Volume.from_name("my-volume-2")
 # ── Constants ────────────────────────────────────────────────────────────────
 K             = 4
 TEMPERATURE   = 0.9
-MAX_NEW_TOKENS = 32768
+MAX_NEW_TOKENS = 16384
 DATA_FORMAT   = "theorem"
 COLUMN        = "formal_statement"
-VOLUME_FILE   = "Numina_good_last20.json"
+VOLUME_FILE   = "Numina_ones.json"
 RANDOM_SEED   = 42
 
 PREAMBLE = (
@@ -263,29 +263,50 @@ def plot_bar_chart(model_scores, run_name, out_path):
     print(f"Bar graph saved to {out_path}")
 
 @app.function(image=orchestrate_image, volumes={"/vol": vol}, timeout=86400)
+def run_one_model(model_path: str, run_name: str, sample_size: int):
+    import time
+    mp = model_path  # short alias for log prefix
+    model_start = time.time()
+    print(f"\n--- [{mp}] Generating proofs ---", flush=True)
+
+    t0 = time.time()
+    jobs = generate_proofs.remote(model_path, sample_size)
+    t_generate = time.time() - t0
+    print(f"  [{mp}] generate_proofs: {t_generate:.1f}s ({len(jobs)} jobs)", flush=True)
+
+    t0 = time.time()
+    results = list(verify_proof.map(jobs))
+    t_verify = time.time() - t0
+    print(f"  [{mp}] verification: {t_verify:.1f}s", flush=True)
+
+    pass_count, total, pct = compute_pass_at_k(results)
+    print(f"pass@{K} [{mp}]: {pass_count}/{total} ({pct:.1f}%)", flush=True)
+
+    t_total = time.time() - model_start
+    print(f"  [{mp}] total: {t_total:.1f}s", flush=True)
+
+    model_label = model_path.replace("/", "_")
+    save_results.remote(f"{run_name}/{model_label}", {
+        "config": make_config(sample_size),
+        "pass_count": pass_count, "total": total, "pass_at_k_pct": pct,
+        "timing": {"generate_s": t_generate, "verify_s": t_verify, "total_s": t_total},
+        "results": results,
+    })
+    return model_path, pass_count, total, pct, results
+
+
+@app.function(image=orchestrate_image, volumes={"/vol": vol}, timeout=86400)
 def run_comparison(model_list: list, run_name: str, sample_size: int):
     import os, time
-    all_results, model_scores = {}, {}
-    for model_path in model_list:
-        model_start = time.time()
-        print(f"\n--- Generating proofs for: {model_path} ---", flush=True)
-        t0 = time.time()
-        jobs = generate_proofs.remote(model_path, sample_size)
-        print(f"  [time] generate_proofs: {time.time()-t0:.1f}s ({len(jobs)} jobs)", flush=True)
+    wall_start = time.time()
+    outputs = list(run_one_model.starmap([(m, run_name, sample_size) for m in model_list]))
+    wall_total = time.time() - wall_start
+    print(f"\n[time] full parallel run ({len(model_list)} models): {wall_total:.1f}s", flush=True)
 
-        t0 = time.time()
-        results = list(verify_proof.map(jobs))
-        print(f"  [time] verification: {time.time()-t0:.1f}s", flush=True)
+    all_results = {m: {"pass_count": pc, "total": t, "pass_at_k_pct": pct, "results": r} for m, pc, t, pct, r in outputs}
+    model_scores = {m: pct for m, pc, t, pct, r in outputs}
 
-        pass_count, total, pct = compute_pass_at_k(results)
-        print(f"pass@{K} [{model_path}]: {pass_count}/{total} ({pct:.1f}%)", flush=True)
-
-        model_scores[model_path] = pct
-        all_results[model_path] = {"pass_count": pass_count, "total": total, "pass_at_k_pct": pct, "results": results}
-        save_results.remote(model_path, {"config": make_config(sample_size), "models": [all_results[model_path]]})
-        print(f"  [time] total for {model_path}: {time.time()-model_start:.1f}s", flush=True)
-
-    save_results.remote(run_name, {"config": make_config(sample_size), "models": all_results})
+    save_results.remote(run_name, {"config": make_config(sample_size), "wall_time_s": wall_total, "models": all_results})
 
     out_path = f"/vol/results/{run_name}/comparison.png"
     os.makedirs(f"/vol/results/{run_name}", exist_ok=True)
