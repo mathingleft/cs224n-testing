@@ -53,8 +53,8 @@ def verify(lean_code):
     else:
         status = "FAIL"
 
-    first_error = lean_out.split("\n")[0] if lean_out else None
-    return {"status": status, "error": first_error}
+    error_lines = "\n".join(lean_out.split("\n")[:10]) if lean_out else None
+    return {"status": status, "error": error_lines}
 
 @app.function(gpu="H100:2", image=gpu_image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=21600)
 def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
@@ -211,6 +211,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
             print(f"Generated {len(feedback_prompts)} error feedback analyses", flush=True)
 
         # --- Step 5: Per-example teacher scoring + training ---
+        logs = []
         for j, (entry, proof_text, verification) in enumerate(zip(batch, all_proof_texts, all_verifications)):
             print(f"Epoch {i}, Training {j+1}/{len(batch)} — verify: {verification['status']}", flush=True)
 
@@ -220,7 +221,10 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
             response_ids = tokenizer(proof_text, return_tensors="pt", add_special_tokens=False).input_ids.to("cuda:0")
             student_prompt_length = prompt_ids.shape[-1]
             student_response_length = response_ids.shape[-1]
-
+            save = {
+                    "epoch": i,
+                    "batch_sample": j+1
+            }
             if student_response_length == 0:
                 continue
 
@@ -232,6 +236,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
             student.train()
             student_outputs = student(input_ids=generated)
             student_logits = student_outputs.logits[:, student_prompt_length-1:-1, :].contiguous()
+            save["student_logs"] = student_outputs
             del student_outputs, generated
 
             # teacher scores the same sequence (on GPU 1)
@@ -244,12 +249,16 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
 
                 Error analysis: {all_feedbacks[j]}
             """
+            save["feedback"] = all_feedbacks[j]
+            save["teacher_prompt"] = teacher_prompt
+            
             teacher_input_ids = tokenizer(teacher_prompt, return_tensors="pt", padding=True).to("cuda:1")["input_ids"]
             combined = torch.cat([teacher_input_ids, response_ids_gpu1], dim=-1)
             with torch.no_grad():
                 teacher_outputs = teacher(input_ids=combined)
             teacher_prompt_length_t = teacher_input_ids.shape[-1]
             teacher_logits = teacher_outputs.logits[:, teacher_prompt_length_t-1:-1, :].contiguous()
+            save["teacher_logs"] = teacher_outputs
             del teacher_outputs, teacher_input_ids, combined, response_ids_gpu1
 
             student_logs = F.log_softmax(student_logits, dim=-1)
@@ -258,15 +267,21 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
             with torch.no_grad():
                 teacher_logs = F.log_softmax(teacher_logits, dim=-1).to("cuda:0")
             del teacher_logits
-
+            
             loss = F.kl_div(target=student_logs, input=teacher_logs, log_target=True, reduction="sum") / student_response_length #should be reverse KL
+            save["loss"] = loss
             del student_logs, teacher_logs
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             print(f"  loss: {loss.item():.4f}, generated {student_response_length} tokens", flush=True)
             torch.cuda.empty_cache()
+            logs.append(
+                save
+            )
         print(f"EPOCH {i} time: {time.time() - epoch_start}")
+        with open(f"/vol/models/{model_name}/{run_name}/epoch-{i}_logs.json", "w") as f:
+            json.dump(logs, f)
         student.save_pretrained(f"/vol/models/{model_name}/{run_name}/epoch-{i}")
         tokenizer.save_pretrained(f"/vol/models/{model_name}/{run_name}/epoch-{i}")
     print(f"TIME: {time.time() - start}")

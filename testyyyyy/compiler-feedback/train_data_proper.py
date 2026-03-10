@@ -36,7 +36,7 @@ def verify(lean_code):
             cwd="/lean-checker",
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
         compiles = result.returncode == 0
         timed_out = False
@@ -84,7 +84,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
     student = get_peft_model(student, lora_config)
     student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     student.enable_input_require_grads()
-    teacher = AutoModelForCausalLM.from_pretrained(base_model, local_files_only=True, device_map={"": "cuda:1"}, torch_dtype="auto")
+    # teacher = AutoModelForCausalLM.from_pretrained(base_model, local_files_only=True, device_map={"": "cuda:0"}, torch_dtype="auto")
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
     # data = json.load(open(f"/vol/data/{data_file}", "r"))
@@ -113,7 +113,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
     # Move teacher to CPU temporarily so vLLM can claim GPU 1 memory
     lora_dir = "/tmp/student_lora"
     student.save_pretrained(lora_dir)
-    teacher.to("cpu")
+    # teacher.to("cpu")
     torch.cuda.empty_cache()
     import os
     os.environ["CUDA_VISIBLE_DEVICES"] = "1"
@@ -128,7 +128,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
     )
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     # Move teacher back — vLLM has reserved its memory, remaining ~24GB is enough for teacher (~16GB)
-    teacher.to("cuda:1")
+    # teacher.to("cuda:0")
 
     for i in range(N_EPOCHS):
         random.shuffle(train_data)
@@ -200,7 +200,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
             if student_response_length == 0:
                 continue
 
-            response_ids_gpu1 = response_ids.to("cuda:1")
+            response_ids_teacher = response_ids.to("cuda:0")
             generated = torch.cat([prompt_ids, response_ids], dim=-1)
             del prompt_ids, response_ids
 
@@ -210,7 +210,7 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
             student_logits = student_outputs.logits[:, student_prompt_length-1:-1, :].contiguous()
             del student_outputs, generated
 
-            # teacher scores the same sequence (on GPU 1)
+            # teacher scores the same sequence (self-distillation: same model, privileged prompt)
             teacher_prompt = f"""
                 Solution: {entry["formal_proof"]}
 
@@ -218,19 +218,19 @@ def sdft(model_name: str, data_file: str, run_name: str, sample_size: int = 0):
 
                 Compiler errors: {verification['error'] if verification['status'] != 'PASS' else ''}
             """
-            teacher_input_ids = tokenizer(teacher_prompt, return_tensors="pt", padding=True).to("cuda:1")["input_ids"]
-            combined = torch.cat([teacher_input_ids, response_ids_gpu1], dim=-1)
+            teacher_input_ids = tokenizer(teacher_prompt, return_tensors="pt", padding=True).to("cuda:0")["input_ids"]
+            combined = torch.cat([teacher_input_ids, response_ids_teacher], dim=-1)
             with torch.no_grad():
-                teacher_outputs = teacher(input_ids=combined)
+                teacher_outputs = student(input_ids=combined)
             teacher_prompt_length_t = teacher_input_ids.shape[-1]
             teacher_logits = teacher_outputs.logits[:, teacher_prompt_length_t-1:-1, :].contiguous()
-            del teacher_outputs, teacher_input_ids, combined, response_ids_gpu1
+            del teacher_outputs, teacher_input_ids, combined, response_ids_teacher
 
             student_logs = F.log_softmax(student_logits, dim=-1)
             del student_logits
             # Compute teacher log_softmax on GPU 1 to avoid copying raw logits to GPU 0
             with torch.no_grad():
-                teacher_logs = F.log_softmax(teacher_logits, dim=-1).to("cuda:0")
+                teacher_logs = F.log_softmax(teacher_logits, dim=-1)
             del teacher_logits
 
             loss = F.kl_div(target=student_logs, input=teacher_logs, log_target=True, reduction="sum") / student_response_length #should be reverse KL

@@ -3,6 +3,13 @@ import collections
 
 app = modal.App(name="compare-pass-at-k")
 
+image = (
+    modal.Image.debian_slim(python_version="3.13")
+    .uv_pip_install(
+        # "huggingface_hub",
+        "matplotlib"
+    )
+)
 lean_image = modal.Image.from_dockerfile("lean/lean_nocuda.dockerfile", add_python="3.13")
 gpu_image = lean_image.apt_install("gcc").uv_pip_install("transformers", "torch", "accelerate", "peft", "vllm")
 vol = modal.Volume.from_name("my-volume-1")
@@ -13,7 +20,7 @@ TEMPERATURE   = 0.9
 MAX_NEW_TOKENS = 32768
 DATA_FORMAT   = "theorem"
 COLUMN        = "formal_statement"
-VOLUME_FILE   = "MiniF2F_train.json"
+VOLUME_FILE   = "numina_ones.json"
 RANDOM_SEED   = 42
 
 PREAMBLE = (
@@ -38,6 +45,8 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
     from transformers import AutoTokenizer
+    global VOLUME_FILE
+    print(VOLUME_FILE)
 
     # Determine base model name and whether to load an adapter
     parts = BASE_MODEL.strip("/").split("/")
@@ -51,7 +60,7 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
         tokenizer.pad_token = tokenizer.eos_token
 
     model_label = BASE_MODEL
-    data = json.load(open(f"/vol/data/{VOLUME_FILE}"))
+    data = json.load(open(f"/vol/{VOLUME_FILE}"))
     if N_EXAMPLES > 0:
         rng = random.Random(RANDOM_SEED)
         indices = rng.sample(range(len(data)), N_EXAMPLES)
@@ -146,7 +155,8 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
                 "lean_code": lean_code,
                 "truncated": truncated,
                 "model_label": model_label,
-                "generation_length": {len(completion.token_ids)}
+                "generation_length": len(completion.token_ids),
+                "num_pass": entry["num_pass"] if "num_pass" in entry.keys() else None
             })
             print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(completion.token_ids)} tokens", flush=True)
         
@@ -264,7 +274,7 @@ def verify_proof(job):
             cwd="/lean-checker",
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=120,
         )
         compiles = result.returncode == 0
         timed_out = False
@@ -303,8 +313,12 @@ def save_results(run_name: str, all_results: dict):
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-@app.local_entrypoint()
-def main(models: str, run_name: str = "comparison", sample_size: int = 5, data: str = "MiniF2F_train.json"):
+@app.function(
+    image=image,
+    volumes={"/vol": vol},
+    timeout=21600,
+)
+def controls(models: str, run_name: str = "comparison", sample_size: int = 5, data: str = "mini_aime_50.json"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -315,6 +329,7 @@ def main(models: str, run_name: str = "comparison", sample_size: int = 5, data: 
     all_results = {}
     model_scores = {}
 
+    global VOLUME_FILE 
     VOLUME_FILE = data
 
     for model_path in model_list:
@@ -395,6 +410,10 @@ def main(models: str, run_name: str = "comparison", sample_size: int = 5, data: 
                 f"{score:.1f}%", ha="center", va="bottom", fontsize=10)
 
     plt.tight_layout()
-    out_path = f"results_{run_name}.png"
+    out_path = f"vol/results_{run_name}.png"
     fig.savefig(out_path, dpi=150)
     print(f"\nBar graph saved to {out_path}")
+
+@app.local_entrypoint()
+def main(models: str, run_name: str = "comparison", sample_size: int = 5, data: str = "mini_aime_50.json"):
+    controls.remote(models, run_name, sample_size, data)
