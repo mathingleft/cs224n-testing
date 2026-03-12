@@ -12,10 +12,10 @@ VOLUME_FILE = "Numina_proofs.json"
 COLUMN      = "formal_statement"
 
 OFFSET        = 0      # start index into VOLUME_FILE (ignored when RANDOM_SEED is set)
-RANDOM_SEED   = 41     # set to None to use OFFSET instead of random sampling
+RANDOM_SEED   = 42     # set to None to use OFFSET instead of random sampling
 K             = 8
 TEMPERATURE   = 0.9    # used when K > 1
-MAX_NEW_TOKENS = 32768
+MAX_NEW_TOKENS = 8192
 
 # "full_file": Numina-style — strip sorry, no preamble prepended
 # "theorem":   MiniF2F-style — prepend PREAMBLE

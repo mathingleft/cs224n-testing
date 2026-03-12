@@ -17,7 +17,7 @@ GCP_PROJECT = "cs-224n-project-488523"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 N_EPOCHS = 1
-MAX_NEW_TOKENS = 16384
+MAX_NEW_TOKENS = 8192
 TEMPERATURE = 0.7
 LR = 1e-5
 

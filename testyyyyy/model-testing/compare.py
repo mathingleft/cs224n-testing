@@ -9,7 +9,8 @@ orchestrate_image = modal.Image.debian_slim(python_version="3.11").pip_install("
 vol = modal.Volume.from_name("my-volume-2")
 
 # ── Constants ────────────────────────────────────────────────────────────────
-K             = 4
+N_SAMPLES     = 8    # rollouts generated per problem
+PASS_AT_K     = 1    # k for the pass@k estimator (almost always 1)
 TEMPERATURE   = 0.9
 MAX_NEW_TOKENS = 16384
 DATA_FORMAT   = "theorem"
@@ -33,7 +34,7 @@ PREAMBLE = (
     volumes={"/vol": vol},
     timeout=36000,
 )
-def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
+def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0, n_samples: int = N_SAMPLES):
     import json, random
     import os
     from vllm import LLM, SamplingParams
@@ -111,15 +112,15 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
     print(f"  [time] model load: {_time.time()-t0:.1f}s", flush=True)
     stop_tokens = ["<|im_end|>"] if is_goedel else ["```"]
     sampling_params = SamplingParams(
-        n=K,
-        temperature=TEMPERATURE if K > 1 else 0,
+        n=n_samples,
+        temperature=TEMPERATURE if n_samples * PASS_AT_K > 1 else 0,
         max_tokens=MAX_NEW_TOKENS,
         stop=stop_tokens,
     )
     lora_request = LoRARequest("adapter", 1, adapter_path) if use_adapter else None
     t0 = _time.time()
     outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
-    print(f"  [time] vllm generate ({len(prompts)} prompts × K={K}): {_time.time()-t0:.1f}s", flush=True)
+    print(f"  [time] vllm generate ({len(prompts)} prompts × {n_samples} samples): {_time.time()-t0:.1f}s", flush=True)
     print(f"vLLM returned {len(outputs)} outputs, each with {[len(o.outputs) for o in outputs]} completions", flush=True)
     # save generated proofs to volume so they can be inspected later
     # os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
@@ -149,11 +150,12 @@ def generate_proofs(BASE_MODEL: str, N_EXAMPLES: int = 0):
                 "example_idx": idx,
                 "sample_idx": k,
                 "statement": statement,
+                "proof_text": proof_text,
                 "lean_code": lean_code,
                 "truncated": truncated,
                 "model_label": model_label,
             })
-            print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(completion.token_ids)} tokens", flush=True)
+            print(f"  example {i+1}/{len(examples)}, sample {k+1}/{n_samples} — {len(completion.token_ids)} tokens", flush=True)
         
         # with open(f"/vol/results/{RUN_NAME}/_{idx}_proofs.json", "w") as f:
         #     json.dump({"config": CONFIG, "jobs": jobs}, f, indent=2)
@@ -201,8 +203,8 @@ def verify_proof(job):
     else:
         status = "FAIL"
 
-    first_error = lean_out.split("\n")[0] if lean_out else None
-    return {**job, "status": status, "error": first_error}
+    error = lean_out if lean_out else None
+    return {**job, "status": status, "error": error}
 
 
 # ── Stage 3: save results to volume ──────────────────────────────────────────
@@ -221,29 +223,40 @@ def save_results(run_name: str, all_results: dict):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def make_config(sample_size):
+def make_config(sample_size, n_samples=N_SAMPLES, pass_at_k=PASS_AT_K):
     return {
-        "K": K, "SAMPLE_SIZE": sample_size, "TEMPERATURE": TEMPERATURE,
-        "MAX_NEW_TOKENS": MAX_NEW_TOKENS, "DATA_FORMAT": DATA_FORMAT,
-        "VOLUME_FILE": VOLUME_FILE, "RANDOM_SEED": RANDOM_SEED,
+        "N_SAMPLES": n_samples, "PASS_AT_K": pass_at_k, "SAMPLE_SIZE": sample_size,
+        "TEMPERATURE": TEMPERATURE, "MAX_NEW_TOKENS": MAX_NEW_TOKENS,
+        "DATA_FORMAT": DATA_FORMAT, "VOLUME_FILE": VOLUME_FILE, "RANDOM_SEED": RANDOM_SEED,
     }
 
-def compute_pass_at_k(results):
+def compute_pass_at_k(results, pass_at_k=PASS_AT_K):
+    from math import comb
     by_example = collections.defaultdict(list)
     for r in results:
         by_example[r["example_idx"]].append(r)
-    pass_count = 0
+
+    estimates = []
     for idx, samples in sorted(by_example.items()):
         statuses = [s["status"] for s in samples]
-        passed = "PASS" in statuses
-        if passed:
-            pass_count += 1
-        print(f"  example {idx}: {statuses} {'PASS' if passed else 'FAIL'}")
-    total = len(by_example)
-    pct = 100 * pass_count / max(total, 1)
+        n = len(statuses)
+        c = statuses.count("PASS")
+        # Unbiased estimator: pass@k = 1 - C(n-c, k) / C(n, k)
+        if n - c < pass_at_k:
+            est = 1.0
+        else:
+            est = 1.0 - comb(n - c, pass_at_k) / comb(n, pass_at_k)
+        estimates.append(est)
+        print(f"  example {idx}: {c}/{n} pass  →  pass@{pass_at_k}={est:.3f}  [{', '.join(statuses)}]")
+
+    total = len(estimates)
+    mean_est = sum(estimates) / max(total, 1)
+    pct = 100 * mean_est
+    # pass_count for backwards compat: number of problems with at least one pass
+    pass_count = sum(1 for e in estimates if e > 0)
     return pass_count, total, pct
 
-def plot_bar_chart(model_scores, run_name, out_path):
+def plot_bar_chart(model_scores, run_name, out_path, pass_at_k=PASS_AT_K):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -252,8 +265,8 @@ def plot_bar_chart(model_scores, run_name, out_path):
     bars = ax.bar(range(len(names)), scores, color="steelblue")
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels(names, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel(f"pass@{K} (%)")
-    ax.set_title(f"pass@{K} Comparison ({run_name})")
+    ax.set_ylabel(f"pass@{pass_at_k} (%)")
+    ax.set_title(f"pass@{pass_at_k} Comparison ({run_name})")
     ax.set_ylim(0, max(scores + [10]) * 1.2)
     for bar, score in zip(bars, scores):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
@@ -263,14 +276,14 @@ def plot_bar_chart(model_scores, run_name, out_path):
     print(f"Bar graph saved to {out_path}")
 
 @app.function(image=orchestrate_image, volumes={"/vol": vol}, timeout=86400)
-def run_one_model(model_path: str, run_name: str, sample_size: int):
+def run_one_model(model_path: str, run_name: str, sample_size: int, n_samples: int = N_SAMPLES, pass_at_k: int = PASS_AT_K):
     import time
     mp = model_path  # short alias for log prefix
     model_start = time.time()
-    print(f"\n--- [{mp}] Generating proofs ---", flush=True)
+    print(f"\n--- [{mp}] Generating proofs (n_samples={n_samples}, pass@{pass_at_k}) ---", flush=True)
 
     t0 = time.time()
-    jobs = generate_proofs.remote(model_path, sample_size)
+    jobs = generate_proofs.remote(model_path, sample_size, n_samples)
     t_generate = time.time() - t0
     print(f"  [{mp}] generate_proofs: {t_generate:.1f}s ({len(jobs)} jobs)", flush=True)
 
@@ -279,15 +292,15 @@ def run_one_model(model_path: str, run_name: str, sample_size: int):
     t_verify = time.time() - t0
     print(f"  [{mp}] verification: {t_verify:.1f}s", flush=True)
 
-    pass_count, total, pct = compute_pass_at_k(results)
-    print(f"pass@{K} [{mp}]: {pass_count}/{total} ({pct:.1f}%)", flush=True)
+    pass_count, total, pct = compute_pass_at_k(results, pass_at_k)
+    print(f"pass@{pass_at_k} [{mp}]: {pass_count}/{total} problems with ≥1 pass  mean={pct:.1f}%", flush=True)
 
     t_total = time.time() - model_start
     print(f"  [{mp}] total: {t_total:.1f}s", flush=True)
 
     model_label = model_path.replace("/", "_")
     save_results.remote(f"{run_name}/{model_label}", {
-        "config": make_config(sample_size),
+        "config": make_config(sample_size, n_samples, pass_at_k),
         "pass_count": pass_count, "total": total, "pass_at_k_pct": pct,
         "timing": {"generate_s": t_generate, "verify_s": t_verify, "total_s": t_total},
         "results": results,
@@ -296,28 +309,28 @@ def run_one_model(model_path: str, run_name: str, sample_size: int):
 
 
 @app.function(image=orchestrate_image, volumes={"/vol": vol}, timeout=86400)
-def run_comparison(model_list: list, run_name: str, sample_size: int):
+def run_comparison(model_list: list, run_name: str, sample_size: int, n_samples: int = N_SAMPLES, pass_at_k: int = PASS_AT_K):
     import os, time
     wall_start = time.time()
-    outputs = list(run_one_model.starmap([(m, run_name, sample_size) for m in model_list]))
+    outputs = list(run_one_model.starmap([(m, run_name, sample_size, n_samples, pass_at_k) for m in model_list]))
     wall_total = time.time() - wall_start
     print(f"\n[time] full parallel run ({len(model_list)} models): {wall_total:.1f}s", flush=True)
 
     all_results = {m: {"pass_count": pc, "total": t, "pass_at_k_pct": pct, "results": r} for m, pc, t, pct, r in outputs}
     model_scores = {m: pct for m, pc, t, pct, r in outputs}
 
-    save_results.remote(run_name, {"config": make_config(sample_size), "wall_time_s": wall_total, "models": all_results})
+    save_results.remote(run_name, {"config": make_config(sample_size, n_samples, pass_at_k), "wall_time_s": wall_total, "models": all_results})
 
     out_path = f"/vol/results/{run_name}/comparison.png"
     os.makedirs(f"/vol/results/{run_name}", exist_ok=True)
-    plot_bar_chart(model_scores, run_name, out_path)
+    plot_bar_chart(model_scores, run_name, out_path, pass_at_k)
     vol.commit()
     print(f"Chart saved to volume: {out_path}", flush=True)
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
-def main(models: str, run_name: str, sample_size: int = 5):
+def main(models: str, run_name: str, sample_size: int = 5, n_samples: int = N_SAMPLES, pass_at_k: int = PASS_AT_K):
     model_list = [m.strip() for m in models.split(",")]
-    print(f"Comparing {len(model_list)} models: {model_list}")
-    run_comparison.remote(model_list, run_name, sample_size)
+    print(f"Comparing {len(model_list)} models: {model_list}  (n_samples={n_samples}, pass@{pass_at_k})")
+    run_comparison.remote(model_list, run_name, sample_size, n_samples, pass_at_k)

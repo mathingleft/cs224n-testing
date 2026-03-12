@@ -15,7 +15,7 @@ gpu_image = (
 vol = modal.Volume.from_name("my-volume-2")
 
 N_EPOCHS = 20
-MAX_NEW_TOKENS = 32768
+MAX_NEW_TOKENS = 8192
 TEMPERATURE = 0.7
 LR = 1e-5
 
