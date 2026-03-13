@@ -11,7 +11,7 @@ image = (
 )
 vol = modal.Volume.from_name("my-volume-1", create_if_missing=True)
 
-REPO_ID = "Goedel-LM/Goedel-Prover-V2-32B"
+REPO_ID = "Goedel-LM/Goedel-Prover-V2-8B"
 
 @app.function(image=image, secrets=[modal.Secret.from_name("huggingface-secret")], volumes={"/vol": vol}, timeout=10800)
 def setup():
