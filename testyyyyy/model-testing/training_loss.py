@@ -5,9 +5,9 @@ Usage:
     python model-testing/training_loss.py <folder> [--out output.png]
 
 Produces a figure with:
-  1. Top: heatmap — PASS (green) / not-PASS (red) per (epoch, example)
-  2. Bottom-left: pass rate per epoch (fraction of examples that passed)
-  3. Bottom-right: mean training loss per epoch
+  1. Top-left:  Pass@1 per epoch (fraction of examples that passed)
+  2. Top-right: Mean training loss per epoch
+  3. Bottom:    Mean gradient norm per epoch
 """
 
 import argparse
@@ -18,7 +18,6 @@ import re
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
 
 
@@ -33,48 +32,29 @@ def load_epochs(folder):
 
 
 def compute_stats(epochs):
-    n_epochs = len(epochs)
-    n_examples = max(len(d["examples"]) for d in epochs)
-    pass_grid = np.zeros((n_examples, n_epochs), dtype=float)
-    pass_rate, mean_loss = [], []
+    pass_rate, mean_loss, mean_grad_norm = [], [], []
 
-    for col, data in enumerate(epochs):
+    for data in epochs:
         examples = data["examples"]
-        passed, losses = 0, []
-        for row, ex in enumerate(examples):
-            is_pass = ex["verification_status"] == "PASS"
-            pass_grid[row, col] = 1.0 if is_pass else 0.0
-            if is_pass:
+        passed, losses, grad_norms = 0, [], []
+        for ex in examples:
+            if ex["verification_status"] == "PASS":
                 passed += 1
-            if ex["loss"] is not None:
+            if ex.get("loss") is not None:
                 losses.append(ex["loss"])
+            if ex.get("grad_norm") is not None:
+                grad_norms.append(ex["grad_norm"])
         pass_rate.append(passed / len(examples) if examples else 0)
         mean_loss.append(np.mean(losses) if losses else float("nan"))
+        mean_grad_norm.append(np.mean(grad_norms) if grad_norms else float("nan"))
 
-    return pass_grid, pass_rate, mean_loss
-
-
-def plot_heatmap(ax, pass_grid, epoch_nums):
-    n_examples = pass_grid.shape[0]
-    cmap = matplotlib.colors.ListedColormap(["#d73027", "#1a9850"])
-    ax.imshow(pass_grid, aspect="auto", cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
-    ax.set_xticks(range(len(epoch_nums)))
-    ax.set_xticklabels(epoch_nums, fontsize=8)
-    ax.set_yticks(range(n_examples))
-    ax.set_yticklabels([f"ex {i}" for i in range(n_examples)], fontsize=8)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Example")
-    ax.set_title("PASS / not-PASS per epoch per example")
-    ax.legend(handles=[
-        mpatches.Patch(color="#1a9850", label="PASS"),
-        mpatches.Patch(color="#d73027", label="not PASS"),
-    ], loc="upper right", fontsize=8)
+    return pass_rate, mean_loss, mean_grad_norm
 
 
 def plot_pass_rate(ax, epoch_nums, pass_rate):
     ax.plot(epoch_nums, [r * 100 for r in pass_rate], marker="o", color="#1a9850")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Pass rate (%)")
+    ax.set_ylabel("Pass@1 (%)")
     ax.set_title("Pass@1 per epoch")
     ax.set_ylim(0, 105)
     ax.set_xticks(epoch_nums)
@@ -90,17 +70,26 @@ def plot_mean_loss(ax, epoch_nums, mean_loss):
     ax.tick_params(axis="x", labelsize=7)
 
 
+def plot_grad_norm(ax, epoch_nums, mean_grad_norm):
+    ax.plot(epoch_nums, mean_grad_norm, marker="o", color="darkorange")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Mean grad norm")
+    ax.set_title("Mean gradient norm per epoch")
+    ax.set_xticks(epoch_nums)
+    ax.tick_params(axis="x", labelsize=7)
+
+
 def make_figure(epochs, folder_name):
     epoch_nums = [d["epoch"] for d in epochs]
-    pass_grid, pass_rate, mean_loss = compute_stats(epochs)
+    pass_rate, mean_loss, mean_grad_norm = compute_stats(epochs)
 
-    fig = plt.figure(figsize=(max(12, len(epochs) * 0.6), 10))
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.4, 1], hspace=0.45, wspace=0.35)
+    fig, axes = plt.subplots(1, 3, figsize=(max(15, len(epochs) * 0.7), 5))
     fig.suptitle(folder_name, fontsize=13, fontweight="bold")
+    fig.subplots_adjust(wspace=0.35, top=0.88)
 
-    plot_heatmap(fig.add_subplot(gs[0, :]), pass_grid, epoch_nums)
-    plot_pass_rate(fig.add_subplot(gs[1, 0]), epoch_nums, pass_rate)
-    plot_mean_loss(fig.add_subplot(gs[1, 1]), epoch_nums, mean_loss)
+    plot_pass_rate(axes[0], epoch_nums, pass_rate)
+    plot_mean_loss(axes[1], epoch_nums, mean_loss)
+    plot_grad_norm(axes[2], epoch_nums, mean_grad_norm)
 
     return fig
 

@@ -28,7 +28,7 @@ vol = modal.Volume.from_name("my-volume-2")
 SOURCE_FILE    = "data/Numina_proofs.json"
 K              = 8
 TEMPERATURE    = 0.9
-MAX_NEW_TOKENS = 8192
+MAX_NEW_TOKENS = 16384
 RANDOM_SEED    = 42
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -64,13 +64,13 @@ def select_examples(sample_size: int, input_file: str):
 
 
 @app.function(
-    gpu="A100-80GB",
+    gpu="H100",
     image=gpu_image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={"/vol": vol},
     timeout=36000,
 )
-def generate_rollouts(base_model: str, selected: list):
+def generate_rollouts(base_model: str, selected: list, k: int = K, max_new_tokens: int = MAX_NEW_TOKENS):
     import json, re
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
@@ -104,17 +104,17 @@ def generate_rollouts(base_model: str, selected: list):
     print(f"Built {len(prompts)} prompts")
 
     llm = LLM(model=base_path, dtype="auto", gpu_memory_utilization=0.90,
-              max_model_len=MAX_NEW_TOKENS + 2048)
+              max_model_len=max_new_tokens + 2048)
     outputs = llm.generate(prompts, SamplingParams(
-        n=K, temperature=TEMPERATURE, max_tokens=MAX_NEW_TOKENS, stop=["<|im_end|>"],
+        n=k, temperature=TEMPERATURE, max_tokens=max_new_tokens, stop=["<|im_end|>"],
     ))
     print(f"Generated {len(outputs)} outputs")
 
     jobs = []
     for _raw_prompt, (idx, entry), request_output in zip(raw_prompts, metadata, outputs):
-        for k, completion in enumerate(request_output.outputs):
+        for sample_idx, completion in enumerate(request_output.outputs):
             proof_text = completion.text
-            truncated = len(completion.token_ids) >= MAX_NEW_TOKENS
+            truncated = len(completion.token_ids) >= max_new_tokens
             code_blocks = re.findall(r"```lean4?\n(.*?)```", proof_text, re.DOTALL)
             preamble = (
                 "import Mathlib\n"
@@ -125,7 +125,7 @@ def generate_rollouts(base_model: str, selected: list):
             lean_code = preamble + ((code_blocks[-1].strip() + "\n") if code_blocks else (proof_text + "\n"))
             jobs.append({
                 "example_idx": idx,
-                "sample_idx": k,
+                "sample_idx": sample_idx,
                 "statement": entry["formal_statement"],
                 "ground_truth": entry["formal_proof"],
                 "lean_code": lean_code,
@@ -133,7 +133,9 @@ def generate_rollouts(base_model: str, selected: list):
             })
 
     # Save temp file so generation isn't lost if verification crashes
-    temp_path = f"/vol/data/annotation_temp_{len(selected)}.json"
+    first_idx = selected[0][0] if selected else 0
+    last_idx = selected[-1][0] if selected else 0
+    temp_path = f"/vol/data/annotation_temp_{first_idx}-{last_idx}_{len(selected)}.json"
     with open(temp_path, "w") as f:
         json.dump(jobs, f, indent=2)
     vol.commit()
@@ -229,7 +231,7 @@ def save_combined(results: list, input_file: str):
 
 
 @app.function(image=orchestrate_image, volumes={"/vol": vol}, timeout=86400)
-def run(base_model: str, sample_size: int, input_file: str):
+def run(base_model: str, sample_size: int, input_file: str, k: int = K, max_new_tokens: int = MAX_NEW_TOKENS):
     import time
     t0 = time.time()
 
@@ -239,7 +241,7 @@ def run(base_model: str, sample_size: int, input_file: str):
 
     t1 = time.time()
     print("\n=== Stage 2: Generating rollouts ===")
-    jobs = generate_rollouts.remote(base_model, selected)
+    jobs = generate_rollouts.remote(base_model, selected, k, max_new_tokens)
     print(f"  {len(jobs)} jobs generated in {time.time()-t1:.1f}s")
 
     t2 = time.time()
@@ -258,9 +260,11 @@ def main(
     base_model: str,
     sample_size: int = 300,
     input_file: str = "",   # leave empty to start fresh with no existing file
+    k: int = K,
+    max_new_tokens: int = MAX_NEW_TOKENS,
 ):
-    print(f"Model: {base_model} | Sample: {sample_size} | Input: {input_file or '(none, starting fresh)'}")
-    run.remote(base_model, sample_size, input_file)
+    print(f"Model: {base_model} | Sample: {sample_size} | K: {k} | MaxTokens: {max_new_tokens} | Input: {input_file or '(none, starting fresh)'}")
+    run.remote(base_model, sample_size, input_file, k, max_new_tokens)
 
 
 @app.local_entrypoint()

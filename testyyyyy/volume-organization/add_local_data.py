@@ -4,8 +4,10 @@ app = modal.App(name="add-local-data")
 image = modal.Image.debian_slim(python_version="3.13")
 vol = modal.Volume.from_name("my-volume-2", create_if_missing=True)
 
-LOCAL_PATH = "/home/jack/Sync/New Documents/Stanford/Freshman Year 2025-26/Winter 2026/CS 224N/Final Project/new testing good/cs224n-testing/testyyyyy/local-volume/Numina_combined_300.json"
-VOLUME_PATH = "data/Numina_combined_300.json"
+#LOCAL_PATH = "/home/jack/Sync/New Documents/Stanford/Freshman Year 2025-26/Winter 2026/CS 224N/Final Project/new testing good/cs224n-testing/testyyyyy/local-volume/Numina_merged.json"
+LOCAL_PATH = "/home/jack/Sync/New Documents/Stanford/Freshman Year 2025-26/Winter 2026/CS 224N/Final Project/new testing good/cs224n-testing/testyyyyy/local-volume/Numina_test35.json"
+#VOLUME_PATH = "data/Numina_merged.json"
+VOLUME_PATH = "data/Numina_test35.json"
 
 @app.function(image=image, volumes={"/vol": vol}, timeout=600)
 def upload(data: bytes):
