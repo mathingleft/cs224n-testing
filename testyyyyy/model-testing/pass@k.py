@@ -1,0 +1,233 @@
+import modal
+import collections
+import os
+
+app = modal.App(name="pass-at-k")
+
+lean_image = modal.Image.from_dockerfile("lean/lean.dockerfile", add_python="3.13")
+gpu_image = lean_image.uv_pip_install("transformers", "torch", "accelerate", "peft")
+vol = modal.Volume.from_name("my-volume-2")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+BASE_MODEL  = "Goedel-Prover-SFT"
+ADAPTER     = "Goedel-Prover-SFT/run2/epoch-19"  # None → base model
+VOLUME_FILE = "MiniF2F_train.json"
+COLUMN      = "formal_statement"
+
+N_EXAMPLES    = 10
+OFFSET        = 0      # start index into VOLUME_FILE (ignored when RANDOM_SEED is set)
+RANDOM_SEED   = 42     # set to None to use OFFSET instead of random sampling
+K             = 4      # proof attempts per problem  (K=1 → greedy)
+TEMPERATURE   = 0.9    # used when K > 1
+MAX_NEW_TOKENS = 2048
+
+# "full_file": Numina-style — strip sorry, no preamble prepended
+# "theorem":   MiniF2F-style — prepend PREAMBLE
+DATA_FORMAT = "theorem"
+
+RUN_NAME = "Goedel-run2-epoch19-minif2f-0"   # results saved to /vol/results/{RUN_NAME}/
+# ─────────────────────────────────────────────────────────────────────────────
+
+PREAMBLE = (
+    "import Mathlib\n"
+    "import Aesop\n\n"
+    "set_option maxHeartbeats 0\n\n"
+    "open BigOperators Real Nat Topology Rat\n\n"
+)
+
+CONFIG = {
+    "BASE_MODEL": BASE_MODEL,
+    "ADAPTER": ADAPTER,
+    "VOLUME_FILE": VOLUME_FILE,
+    "N_EXAMPLES": N_EXAMPLES,
+    "OFFSET": OFFSET,
+    "RANDOM_SEED": RANDOM_SEED,
+    "K": K,
+    "TEMPERATURE": TEMPERATURE,
+    "MAX_NEW_TOKENS": MAX_NEW_TOKENS,
+    "DATA_FORMAT": DATA_FORMAT,
+    "RUN_NAME": RUN_NAME,
+}
+
+
+# ── Stage 1: generate K proofs per problem on GPU ────────────────────────────
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={"/vol": vol},
+    timeout=3600,
+)
+def generate_proofs():
+    import json, torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    base_path = f"/vol/models/{BASE_MODEL}/base"
+    tokenizer = AutoTokenizer.from_pretrained(base_path)
+    model = AutoModelForCausalLM.from_pretrained(base_path, device_map="auto", torch_dtype="auto")
+    if ADAPTER is not None:
+        model = PeftModel.from_pretrained(model, f"/vol/models/{ADAPTER}")
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_label = ADAPTER if ADAPTER is not None else BASE_MODEL
+    import random
+    data = json.load(open(f"/vol/data/{VOLUME_FILE}"))
+    if RANDOM_SEED is not None:
+        rng = random.Random(RANDOM_SEED)
+        indices = rng.sample(range(len(data)), N_EXAMPLES)
+        indices.sort()
+        examples = [(idx, data[idx]) for idx in indices]
+        print(f"Random sample (seed={RANDOM_SEED}): indices {indices}", flush=True)
+    else:
+        examples = [(OFFSET + i, data[OFFSET + i]) for i in range(N_EXAMPLES)]
+    
+    jobs = []
+    for i, (idx, entry) in enumerate(examples):
+        statement = entry[COLUMN].strip()
+        if DATA_FORMAT == "full_file":
+            prompt = statement.rstrip()
+            if prompt.endswith("sorry"):
+                prompt = prompt[:-5].rstrip()
+        else:
+            prompt = PREAMBLE + statement
+
+        inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
+        input_ids = inputs["input_ids"]
+        length = input_ids.shape[-1]
+
+        for k in range(K):
+            gen_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=(K > 1),
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            if K > 1:
+                gen_kwargs["temperature"] = TEMPERATURE
+
+            with torch.no_grad():
+                generated = model.generate(**gen_kwargs)
+
+            generated_tokens = generated[0, length:]
+            truncated = generated_tokens.shape[-1] >= MAX_NEW_TOKENS
+            proof_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            if "```" in proof_text:
+                proof_text = proof_text[:proof_text.rfind("```")].rstrip()
+
+            if DATA_FORMAT == "full_file":
+                lean_code = prompt + proof_text + "\n"
+            else:
+                lean_code = PREAMBLE + statement + proof_text + "\n"
+
+            jobs.append({
+                "example_idx": idx,
+                "sample_idx": k,
+                "statement": statement,
+                "lean_code": lean_code,
+                "truncated": truncated,
+                "model_label": model_label,
+            })
+            print(f"  example {i+1}/{len(examples)}, sample {k+1}/{K} — {len(generated_tokens)} tokens", flush=True)
+
+    # Save generated proofs to volume so they can be inspected later
+    os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
+    with open(f"/vol/results/{RUN_NAME}/proofs.json", "w") as f:
+        import json as _json
+        _json.dump({"config": CONFIG, "jobs": jobs}, f, indent=2)
+    vol.commit()
+    print(f"Saved {len(jobs)} proofs → /vol/results/{RUN_NAME}/proofs.json", flush=True)
+    return jobs
+
+
+# ── Stage 2: verify a single proof on CPU (mapped in parallel) ───────────────
+@app.function(
+    image=lean_image,   # no GPU needed
+    timeout=300,        # per-proof timeout (includes 120 s Lean timeout + overhead)
+)
+def verify_proof(job):
+    import subprocess
+
+    lean_code = job["lean_code"]
+    truncated = job["truncated"]
+
+    with open("/lean-checker/LeanChecker/Test.lean", "w") as f:
+        f.write(lean_code)
+
+    try:
+        result = subprocess.run(
+            ["lake", "env", "lean", "LeanChecker/Test.lean"],
+            cwd="/lean-checker",
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        compiles = result.returncode == 0
+        timed_out = False
+        lean_out = result.stderr.strip() or result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        compiles = False
+        timed_out = True
+        lean_out = ""
+
+    if compiles:
+        status = "PASS"
+    elif timed_out:
+        status = "TIMEOUT"
+    elif truncated:
+        status = "TRUNCATED"
+    else:
+        status = "FAIL"
+
+    first_error = lean_out.split("\n")[0] if lean_out else None
+    return {**job, "status": status, "error": first_error}
+
+
+# ── Stage 3: save results to volume ──────────────────────────────────────────
+@app.function(
+    image=lean_image,
+    volumes={"/vol": vol},
+    timeout=60,
+)
+def save_results(results):
+    import json, os
+    os.makedirs(f"/vol/results/{RUN_NAME}", exist_ok=True)
+    with open(f"/vol/results/{RUN_NAME}/results.json", "w") as f:
+        json.dump({"config": CONFIG, "results": results}, f, indent=2)
+    vol.commit()
+    print(f"Saved results → /vol/results/{RUN_NAME}/results.json", flush=True)
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+@app.local_entrypoint()
+def main():
+    # 1. Generate all proofs on GPU
+    print("Generating proofs on GPU…")
+    jobs = generate_proofs.remote()
+    print(f"Generated {len(jobs)} proofs ({N_EXAMPLES} problems × {K} samples)")
+
+    # 2. Verify all proofs in parallel on CPU containers
+    print("Verifying proofs in parallel on CPU…")
+    results = list(verify_proof.map(jobs))
+
+    # 3. Compute pass@k — problem passes if ANY of its K samples compiles
+    by_example = collections.defaultdict(list)
+    for r in results:
+        by_example[r["example_idx"]].append(r)
+
+    pass_count = 0
+    for idx, samples in sorted(by_example.items()):
+        statuses = [s["status"] for s in samples]
+        passed = "PASS" in statuses
+        if passed:
+            pass_count += 1
+        print(f"  example {idx}: {statuses} {'PASS' if passed else 'FAIL'}")
+
+    total = len(by_example)
+    model_label = results[0]["model_label"] if results else "unknown"
+    print(f"\npass@{K} [{model_label}]: {pass_count}/{total} ({100*pass_count/max(total,1):.1f}%)")
+
+    # 4. Persist results to volume
+    save_results.remote(results)
