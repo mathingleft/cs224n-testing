@@ -12,9 +12,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-LOGS_DIR = "local-volume/Qwen3.5-4B"
-OUT_DIR  = "local-volume/Qwen3.5-4B"
+LOGS_DIR  = "local-volume/Qwen3.5-4B"
+OUT_DIR   = "local-volume/Qwen3.5-4B"
 ALPHA     = 0.09
+MAX_EPOCH = 20   # set to an int (e.g. 20) to truncate all runs at that epoch
 
 RUNS = {
     "SDFT + Compiler Error":  f"{LOGS_DIR}/qwen3.5-4b_qwen3.5-4b_compiler-error",
@@ -136,6 +137,8 @@ for label, run_dir in RUNS.items():
     if not epochs:
         print(f"  skip (no epochs): {run_dir}")
         continue
+    if MAX_EPOCH is not None:
+        epochs = [(e, d) for e, d in epochs if e <= MAX_EPOCH]
     all_runs[label] = epochs
     print(f"  {label}: {len(epochs)} epochs, pass@1 range: "
           f"{min(d['pass_at_1'] for _, d in epochs):.2f} - {max(d['pass_at_1'] for _, d in epochs):.2f}")

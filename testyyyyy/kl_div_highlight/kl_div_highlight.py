@@ -89,15 +89,15 @@ def _build_teacher_prompt(
     gemini_feedback: str | None,
     is_goedel: bool,
     tok,
+    use_compiler_context: bool = True,
+    use_gemini_feedback: bool = True,
 ) -> str:
     """Mirror of build_teacher_prompt in distillation/train.py."""
     compiler_info = f"\nCompiler errors:\n{verification_error}" if verification_error else ""
-    context = (
-        f"[Context]\n"
-        f"Correct proof:\n{formal_proof}\n\n"
-        f"Previous attempt result: {verification_status}{compiler_info}\n\n"
-    )
-    if gemini_feedback:
+    context = f"[Context]\nCorrect proof:\n{formal_proof}\n\n"
+    if use_compiler_context:
+        context += f"Previous attempt result: {verification_status}{compiler_info}\n\n"
+    if use_gemini_feedback and gemini_feedback:
         context += f"Feedback on what went wrong and what to try instead:\n{gemini_feedback}\n\n"
     context += "[Task]\n"
 
@@ -200,11 +200,113 @@ def _render_highlighted(tokens, kl_values, out_path):
     print(f"Saved → {out_path}", flush=True)
 
 
+def _render_combined(variants, out_path):
+    """Render 3 context variants side by side, one subplot per variant.
+
+    variants: list of (label, tokens, kl_values) — one per context variant.
+    Since all variants share the same token sequence, rows align across columns,
+    making token-by-token comparison direct. Colors are globally normalized.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    import numpy as np
+    import os
+
+    CHARS_PER_LINE = 100
+    LINE_H = 1.6
+    CHAR_W = 0.62
+
+    # Global normalization so colors are comparable across all 3 columns
+    all_kl = np.concatenate([kl for _, _, kl in variants])
+    kl_global_min, kl_global_max = float(all_kl.min()), float(all_kl.max())
+    cmap = plt.cm.YlOrRd
+
+    def layout_tokens(tokens, kl_values):
+        kl_norm = (kl_values - kl_global_min) / (kl_global_max - kl_global_min + 1e-8)
+        lines, cur_line, cur_len = [], [], 0
+        for tok, kn, kv in zip(tokens, kl_norm, kl_values):
+            disp = tok.replace("\n", "↵").replace("\t", "→").replace("$", r"\$")
+            n_chars = max(1, len(disp))
+            if cur_len + n_chars > CHARS_PER_LINE and cur_line:
+                lines.append(cur_line)
+                cur_line, cur_len = [], 0
+            cur_line.append((disp, float(kn), float(kv)))
+            cur_len += n_chars
+            if "\n" in tok:
+                lines.append(cur_line)
+                cur_line, cur_len = [], 0
+        if cur_line:
+            lines.append(cur_line)
+        return lines
+
+    all_layouts = [(label, layout_tokens(tokens, kl), kl) for label, tokens, kl in variants]
+    n_lines = max(len(lines) for _, lines, _ in all_layouts)
+
+    col_w = 14          # inches per column
+    fig_w = col_w * len(variants) + 1   # +1 for colorbar
+    fig_h = max(6, n_lines * 0.45 + 2.0)
+
+    # constrained_layout=True handles colorbar + suptitle spacing automatically;
+    # avoids the tight_layout / colorbar conflict that collapses subplots.
+    fig, axes = plt.subplots(1, len(variants), figsize=(fig_w, fig_h), constrained_layout=True)
+    fig.patch.set_facecolor("white")
+    fig.suptitle("Per-token KL(student ∥ teacher) — Context Ablation", fontsize=13, fontweight="bold")
+
+    for ax, (label, lines, kl) in zip(axes, all_layouts):
+        ax.set_facecolor("white")
+        ax.set_xlim(0, CHARS_PER_LINE)
+        ax.set_ylim(0, n_lines * LINE_H)
+        ax.axis("off")
+        ax.set_title(
+            f"{label}\n[min={kl.min():.3f}  max={kl.max():.3f}  mean={kl.mean():.3f}]",
+            fontsize=9, fontweight="bold", pad=6,
+        )
+
+        y = n_lines * LINE_H
+        for line in lines:
+            x = 0.0
+            for disp, kn, kv in line:
+                w = len(disp) * CHAR_W
+                color = cmap(0.05 + 0.9 * kn)
+                ax.add_patch(patches.Rectangle(
+                    (x, y - LINE_H + 0.15), w, LINE_H * 0.7,
+                    facecolor=color, edgecolor="none", alpha=0.85,
+                ))
+                ax.text(
+                    x + w / 2, y - LINE_H * 0.5, disp,
+                    ha="center", va="center",
+                    fontsize=7.5, fontfamily="monospace",
+                    color="black" if kn < 0.7 else "white",
+                )
+                x += w
+            y -= LINE_H
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(kl_global_min, kl_global_max))
+    sm.set_array([])
+    fig.colorbar(sm, ax=list(axes), orientation="vertical", fraction=0.01, pad=0.01,
+                 label="KL divergence (student ∥ teacher)")
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved → {out_path}", flush=True)
+
+
+# Labels and settings for the 3 context variants
+_VARIANTS = [
+    ("Gemini + Compiler Error", True,  True),   # (label, use_compiler_context, use_gemini_feedback)
+    ("Compiler Error Only",     True,  False),
+    ("No Context",              False, False),
+]
+
+
 # ── Shared core logic (batch: load models once, iterate over all jobs) ─────────
 def _compute_and_render_batch(
     student_model, teacher_model,
     jobs,  # list of dicts: formal_statement, formal_proof, verification_status,
-           #   verification_error, gemini_feedback, student_response_text, out_path
+           #   verification_error, gemini_feedback, student_response_text, out_path, use_compiler_context
     student_device, teacher_device_map,
 ):
     import torch
@@ -227,34 +329,9 @@ def _compute_and_render_batch(
         del logits
         return log_probs
 
-    results = []
-    for i, job in enumerate(jobs):
-        print(f"\n--- Job {i + 1}/{len(jobs)}: {job['out_path']} ---", flush=True)
-
-        student_prompt = _build_student_prompt(job["formal_statement"], is_goedel, student_tok)
-        teacher_prompt = _build_teacher_prompt(
-            job["formal_statement"], job["formal_proof"],
-            job["verification_status"], job.get("verification_error"), job.get("gemini_feedback"),
-            is_goedel, student_tok,
-        )
-        print(f"Student prompt: {len(student_prompt)} chars  Teacher prompt: {len(teacher_prompt)} chars", flush=True)
-
-        student_response_text = job["student_response_text"]
-        out_path = job["out_path"]
-
-        print(f"Response: {len(student_response_text)} chars", flush=True)
-        response_ids = student_tok(
-            student_response_text, return_tensors="pt", add_special_tokens=False
-        ).input_ids.to(student_device)
-        tokens = [student_tok.decode([tid]) for tid in response_ids[0]]
-        print(f"Response tokenized to {len(tokens)} tokens", flush=True)
-
-        s_prompt_ids = student_tok(student_prompt, return_tensors="pt").input_ids.to(student_device)
-        s_log_probs = _forward(student, s_prompt_ids, response_ids)
-
+    def _compute_kl(s_log_probs, teacher_prompt, response_ids):
         t_prompt_ids = student_tok(teacher_prompt, return_tensors="pt").input_ids.to(teacher_input_device)
         t_log_probs = _forward(teacher, t_prompt_ids, response_ids.to(teacher_input_device))
-
         n = min(s_log_probs.shape[0], t_log_probs.shape[0])
         v = min(s_log_probs.shape[1], t_log_probs.shape[1])
         kl = F.kl_div(
@@ -263,10 +340,50 @@ def _compute_and_render_batch(
             log_target=True,
             reduction="none",
         ).sum(-1).numpy()
-        tokens = tokens[:n]
+        return kl, n
 
-        print(f"KL: min={kl.min():.3f}  max={kl.max():.3f}  mean={kl.mean():.3f}", flush=True)
-        _render_highlighted(tokens, kl, out_path)
+    results = []
+    for i, job in enumerate(jobs):
+        print(f"\n--- Job {i + 1}/{len(jobs)}: {job['out_path']} ---", flush=True)
+
+        student_prompt = _build_student_prompt(job["formal_statement"], is_goedel, student_tok)
+        out_path = job["out_path"]
+
+        response_ids = student_tok(
+            job["student_response_text"], return_tensors="pt", add_special_tokens=False
+        ).input_ids.to(student_device)
+        tokens = [student_tok.decode([tid]) for tid in response_ids[0]]
+        print(f"Response: {len(tokens)} tokens", flush=True)
+
+        s_prompt_ids = student_tok(student_prompt, return_tensors="pt").input_ids.to(student_device)
+        s_log_probs = _forward(student, s_prompt_ids, response_ids)
+
+        if job.get("combined"):
+            # Compute KL for all 3 variants; student forward is shared
+            variant_results = []
+            for vlabel, use_cc, use_gf in _VARIANTS:
+                teacher_prompt = _build_teacher_prompt(
+                    job["formal_statement"], job["formal_proof"],
+                    job["verification_status"], job.get("verification_error"), job.get("gemini_feedback"),
+                    is_goedel, student_tok,
+                    use_compiler_context=use_cc, use_gemini_feedback=use_gf,
+                )
+                kl, n = _compute_kl(s_log_probs, teacher_prompt, response_ids)
+                print(f"  [{vlabel}] KL: min={kl.min():.3f}  max={kl.max():.3f}  mean={kl.mean():.3f}", flush=True)
+                variant_results.append((vlabel, tokens[:n], kl))
+            _render_combined(variant_results, out_path)
+        else:
+            teacher_prompt = _build_teacher_prompt(
+                job["formal_statement"], job["formal_proof"],
+                job["verification_status"], job.get("verification_error"), job.get("gemini_feedback"),
+                is_goedel, student_tok,
+                use_compiler_context=job.get("use_compiler_context", True),
+                use_gemini_feedback=job.get("use_gemini_feedback", True),
+            )
+            print(f"Student prompt: {len(student_prompt)} chars  Teacher prompt: {len(teacher_prompt)} chars", flush=True)
+            kl, n = _compute_kl(s_log_probs, teacher_prompt, response_ids)
+            print(f"KL: min={kl.min():.3f}  max={kl.max():.3f}  mean={kl.mean():.3f}", flush=True)
+            _render_highlighted(tokens[:n], kl, out_path)
 
         with open(out_path, "rb") as f:
             results.append((f.read(), out_path))
@@ -301,7 +418,7 @@ def highlight_kl_2gpu_batch(student_model, teacher_model, jobs: list):
 
 # ── Entrypoint helpers ────────────────────────────────────────────────────────
 def _load_configs(paths: list[str]) -> list[tuple]:
-    """Load JSON configs and resolve output paths. Returns list of (cfg, vol_out_path)."""
+    """Load JSON configs and resolve output paths. Returns list of (cfg, base_vol_out_path)."""
     import json, os
     items = []
     for path in paths:
@@ -315,6 +432,45 @@ def _load_configs(paths: list[str]) -> list[tuple]:
     return items
 
 
+def _load_epoch_configs(epoch_paths: list[str], student_model: str, teacher_model: str) -> list[tuple]:
+    """Load training epoch-*.json files and produce one config per example.
+
+    The epoch format already contains formal_statement, formal_proof, student_response,
+    verification_status, verification_error, and gemini_feedback per example — no
+    student/teacher model fields, which are supplied via CLI instead.
+    """
+    import json, os
+    items = []
+    student_label = student_model.replace("/", "_")
+    teacher_label = teacher_model.replace("/", "_")
+    for path in epoch_paths:
+        with open(path) as f:
+            epoch = json.load(f)
+        epoch_num = epoch.get("epoch", os.path.splitext(os.path.basename(path))[0])
+        for ex in epoch["examples"]:
+            ex_idx = ex.get("example_idx", ex.get("data_index", len(items)))
+            cfg = {
+                "student_model":      student_model,
+                "teacher_model":      teacher_model,
+                "formal_statement":   ex["formal_statement"],
+                "formal_proof":       ex["formal_proof"],
+                "student_response":   ex["student_response"],
+                "verification_status": ex.get("verification_status", "UNKNOWN"),
+                "verification_error": ex.get("verification_error"),
+                "gemini_feedback":    ex.get("gemini_feedback"),
+            }
+            default_out = f"results/kl_highlight/{student_label}_vs_{teacher_label}_epoch{epoch_num}_ex{ex_idx}.png"
+            items.append((cfg, default_out))
+    return items
+
+
+def _out_path_with_suffix(base_out: str, suffix: str) -> str:
+    """Insert a suffix before the file extension: foo.png → foo_suffix.png."""
+    import os
+    stem, ext = os.path.splitext(base_out)
+    return f"{stem}_{suffix}{ext}"
+
+
 def _group_by_models(items: list[tuple]) -> dict[tuple, list]:
     """Group (cfg, out_path) pairs by (student_model, teacher_model)."""
     from collections import defaultdict
@@ -324,15 +480,32 @@ def _group_by_models(items: list[tuple]) -> dict[tuple, list]:
     return groups
 
 
-def _cfg_to_job(cfg: dict, vol_out_path: str) -> dict:
+def _cfg_to_job(cfg: dict, vol_out_path: str, use_compiler_context: bool = True, use_gemini_feedback: bool = True) -> dict:
     return {
         "formal_statement":      cfg["formal_statement"],
         "formal_proof":          cfg["formal_proof"],
-        "verification_status":   cfg["verification_status"],
+        "verification_status":   cfg.get("verification_status", "UNKNOWN"),
         "verification_error":    cfg.get("verification_error"),
         "gemini_feedback":       cfg.get("gemini_feedback"),
         "student_response_text": cfg["student_response"],
         "out_path":              vol_out_path,
+        "use_compiler_context":  use_compiler_context,
+        "use_gemini_feedback":   use_gemini_feedback,
+    }
+
+
+def _cfg_to_combined_job(cfg: dict, base_out: str) -> dict:
+    import os
+    stem, ext = os.path.splitext(base_out)
+    return {
+        "formal_statement":      cfg["formal_statement"],
+        "formal_proof":          cfg["formal_proof"],
+        "verification_status":   cfg.get("verification_status", "UNKNOWN"),
+        "verification_error":    cfg.get("verification_error"),
+        "gemini_feedback":       cfg.get("gemini_feedback"),
+        "student_response_text": cfg["student_response"],
+        "out_path":              f"{stem}_combined{ext}",
+        "combined":              True,
     }
 
 
@@ -358,17 +531,66 @@ def _save_results_locally(batch_results: list) -> None:
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
-def main(input_files: str):
+def main(
+    input_files: str = "",
+    epoch_files: str = "",
+    student_model: str = "",
+    teacher_model: str = "",
+    combined: bool = False,
+):
     """
-    Comma-separated list of input JSON files (same format as response_template.json).
-    Files sharing the same student+teacher model are batched into one GPU call.
+    Two input modes:
+
+    1. Response JSON files (student/teacher model embedded in each file):
+         --input-files "r0-1-1.json,r0-1-2.json"
+
+    2. Training epoch JSON files (student/teacher model passed via CLI):
+         --epoch-files "epoch-19.json"  --student-model <id>  --teacher-model <id>
+         --epoch-files "epoch-18.json,epoch-19.json"  --student-model <id>  --teacher-model <id>
+       Generates one graph per example (all 10) per epoch file.
+
+    Output modes (apply to both input modes):
+      Default:   3 separate PNGs per example — gemini_compiler / compiler_only / no_context
+      --combined: 1 stacked PNG per example with all 3 variants, globally normalized colors
 
     Examples:
-        modal run kl_div_highlight/kl_div_highlight.py --input-files response0.json
-        modal run kl_div_highlight/kl_div_highlight.py --input-files "r0.json,r1.json,r2.json"
+        modal run kl_div_highlight/kl_div_highlight.py \\
+            --input-files "kl_div_highlight/student_responses/r0-1-1.json" --combined
+        modal run kl_div_highlight/kl_div_highlight.py \\
+            --epoch-files "local-volume/training_logs_cache/run/epoch-19.json" \\
+            --student-model Goedel-LM/Goedel-Prover-V2-8B/base \\
+            --teacher-model Goedel-LM/Goedel-Prover-V2-32B/base \\
+            --combined
     """
-    paths = [p.strip() for p in input_files.split(",")]
-    groups = _group_by_models(_load_configs(paths))
-    for (student_model, teacher_model), items in groups.items():
-        jobs = [_cfg_to_job(cfg, out) for cfg, out in items]
-        _save_results_locally(_dispatch_batch(student_model, teacher_model, jobs))
+    from collections import defaultdict
+
+    if epoch_files:
+        if not student_model or not teacher_model:
+            raise ValueError("--student-model and --teacher-model are required when using --epoch-files")
+        paths = [p.strip() for p in epoch_files.split(",")]
+        configs = _load_epoch_configs(paths, student_model, teacher_model)
+    elif input_files:
+        configs = _load_configs([p.strip() for p in input_files.split(",")])
+    else:
+        raise ValueError("Provide either --input-files or --epoch-files")
+
+    if combined:
+        groups = _group_by_models(configs)
+        for (sm, tm), items in groups.items():
+            jobs = [_cfg_to_combined_job(cfg, out) for cfg, out in items]
+            _save_results_locally(_dispatch_batch(sm, tm, jobs))
+    else:
+        VARIANT_SETTINGS = [
+            ("gemini_compiler", True,  True),
+            ("compiler_only",   True,  False),
+            ("no_context",      False, False),
+        ]
+        groups = defaultdict(list)
+        for cfg, base_out in configs:
+            for suffix, use_cc, use_gf in VARIANT_SETTINGS:
+                out = _out_path_with_suffix(base_out, suffix)
+                groups[(cfg["student_model"], cfg["teacher_model"])].append(
+                    _cfg_to_job(cfg, out, use_compiler_context=use_cc, use_gemini_feedback=use_gf)
+                )
+        for (sm, tm), jobs in groups.items():
+            _save_results_locally(_dispatch_batch(sm, tm, jobs))
