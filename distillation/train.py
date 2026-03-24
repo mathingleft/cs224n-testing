@@ -56,7 +56,7 @@ vol = modal.Volume.from_name("my-volume-2")
 GCP_PROJECT  = "cs-224n-project-488523"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 
-N_EPOCHS   = 60
+N_EPOCHS   = 20
 BATCH_SIZE = 10   # examples processed per epoch (sequential within epoch)
 LR         = 1e-5
 
