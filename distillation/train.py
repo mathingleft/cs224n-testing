@@ -6,12 +6,12 @@ Architecture:
   Teacher  — larger frozen LM on GPU 2 (or student itself for self-distillation)
   Inference — vLLM on GPU 1, reloads the student LoRA checkpoint each epoch
   Verifier — Lean 4 compiler running in a separate lean_image container
-  Feedback — optional Gemini critique of each proof, injected into the teacher prompt
+  Feedback — optional critique of each proof (gemini, self, or none), injected into the teacher prompt
 
 Per-epoch flow:
   1. vLLM generates proof candidates using current student LoRA weights
   2. Lean verifier checks each proof in parallel
-  3. (optional) Gemini provides per-proof natural-language feedback
+  3. (optional) Gemini or the student model itself provides per-proof natural-language feedback
   4. Teacher scores student proofs; reverse KL loss is backpropagated through student
   5. Epoch JSON log and LoRA checkpoint are saved to the Modal volume
 
@@ -125,36 +125,36 @@ def verify(lean_code: str, truncated: bool = False) -> dict:
 @app.function(gpu="H100:2", image=gpu_image, secrets=_SECRETS, volumes={"/vol": vol}, timeout=86400)
 def distillation_self(
     model_name: str, data_file: str, run_name: str,
-    sample_size: int = 0, use_gemini: bool = True,
+    sample_size: int = 0, feedback: str = "none",
     resume_from: str = "", start_epoch: int = 0,
     use_compiler_context: bool = True,
 ):
     """Self-distillation: teacher == student weights (2 GPUs)."""
-    _distillation(model_name, data_file, run_name, sample_size, "", use_gemini, resume_from, start_epoch, use_compiler_context=use_compiler_context)
+    _distillation(model_name, data_file, run_name, sample_size, "", feedback, resume_from, start_epoch, use_compiler_context=use_compiler_context)
 
 
 @app.function(gpu="H100:2", image=gpu_image, secrets=_SECRETS, volumes={"/vol": vol}, timeout=86400)
 def distillation_small_teacher(
     model_name: str, data_file: str, run_name: str,
-    sample_size: int = 0, teacher_model_name: str = "", use_gemini: bool = True,
+    sample_size: int = 0, teacher_model_name: str = "", feedback: str = "none",
     resume_from: str = "", start_epoch: int = 0,
     use_compiler_context: bool = True,
 ):
     """Small-teacher distillation: student + frozen teacher both on GPU 0, vLLM on GPU 1 (2 GPUs).
     Use when teacher fits on the same GPU as the student (e.g. same-size or smaller frozen model)."""
-    _distillation(model_name, data_file, run_name, sample_size, teacher_model_name, use_gemini, resume_from, start_epoch, small_teacher=True, use_compiler_context=use_compiler_context)
+    _distillation(model_name, data_file, run_name, sample_size, teacher_model_name, feedback, resume_from, start_epoch, small_teacher=True, use_compiler_context=use_compiler_context)
 
 
 @app.function(gpu="H100:3", image=gpu_image, secrets=_SECRETS, volumes={"/vol": vol}, timeout=86400)
 def distillation_teacher(
     model_name: str, data_file: str, run_name: str,
-    sample_size: int = 0, teacher_model_name: str = "", use_gemini: bool = True,
+    sample_size: int = 0, teacher_model_name: str = "", feedback: str = "none",
     resume_from: str = "", start_epoch: int = 0,
     use_compiler_context: bool = True,
 ):
     """Large-teacher distillation: frozen teacher isolated on GPU 2 (3 GPUs).
     Use when teacher is too large to share GPU 0 with the student."""
-    _distillation(model_name, data_file, run_name, sample_size, teacher_model_name, use_gemini, resume_from, start_epoch, use_compiler_context=use_compiler_context)
+    _distillation(model_name, data_file, run_name, sample_size, teacher_model_name, feedback, resume_from, start_epoch, use_compiler_context=use_compiler_context)
 
 
 # ── Core training logic ────────────────────────────────────────────────────────
@@ -162,12 +162,14 @@ def distillation_teacher(
 def _distillation(
     model_name: str, data_file: str, run_name: str,
     sample_size: int = 0, teacher_model_name: str = "",
-    use_gemini: bool = True, resume_from: str = "", start_epoch: int = 0,
+    feedback: str = "none", resume_from: str = "", start_epoch: int = 0,
     small_teacher: bool = False, use_compiler_context: bool = True,
 ):
     """
     Main distillation loop. Imported libraries are deferred to here because
     this function runs inside the gpu_image container on Modal workers.
+
+    feedback: "gemini" (Gemini API), "self" (student generates its own feedback via vLLM), or "none"
     """
     import time, re, os, json
     import torch
@@ -176,8 +178,6 @@ def _distillation(
     from peft import get_peft_model, LoraConfig, TaskType
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
-    from google import genai
-    from google.oauth2 import service_account
 
     run_start = time.time()
     torch.cuda.empty_cache()
@@ -229,14 +229,18 @@ def _distillation(
         # Self-distillation: teacher logits come from the same LoRA-updated weights
         teacher = student
 
-    # ── Gemini client ──────────────────────────────────────────────────────────
-    gemini_client = genai.Client(
-        vertexai=True, project=GCP_PROJECT, location="global",
-        credentials=service_account.Credentials.from_service_account_info(
-            json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]),
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        ),
-    )
+    # ── Gemini client (only when feedback="gemini") ─────────────────────────────
+    gemini_client = None
+    if feedback == "gemini":
+        from google import genai
+        from google.oauth2 import service_account
+        gemini_client = genai.Client(
+            vertexai=True, project=GCP_PROJECT, location="global",
+            credentials=service_account.Credentials.from_service_account_info(
+                json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"]),
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            ),
+        )
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=LR)
     sampling_params = SamplingParams(
@@ -335,7 +339,7 @@ def _distillation(
             )
         return context + prompt_text
 
-    def get_gemini_feedback(entry, proof_text, verification):
+    def _build_feedback_prompt(entry, proof_text, verification):
         status      = verification["status"]
         error_block = f"\nCompiler errors:\n{verification['error']}" if verification["error"] else ""
         if status == "PASS":
@@ -352,7 +356,7 @@ def _distillation(
                 "(3) what tactics or proof strategies would likely succeed. "
                 "Focus on concrete Lean 4 mistakes, not general advice."
             )
-        prompt = (
+        return (
             f"You are an expert in Lean 4 formal mathematics. A student model attempted to prove the following theorem:\n\n"
             f"Theorem:\n{entry['formal_statement']}\n\n"
             f"Correct proof:\n{entry['formal_proof']}\n\n"
@@ -360,6 +364,8 @@ def _distillation(
             f"Compiler result: {status}{error_block}\n\n"
             f"{question}"
         )
+
+    def _gemini_generate(prompt):
         for attempt in range(7):
             try:
                 return gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt).text.strip()
@@ -370,6 +376,27 @@ def _distillation(
                     time.sleep(wait)
                 else:
                     raise
+
+    def _vllm_generate(prompt, lora_request=None):
+        if is_chat_model:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+            )
+        feedback_params = SamplingParams(
+            max_tokens=2048, temperature=0.3,
+            stop=["<|im_end|>"] if is_chat_model else None,
+        )
+        outputs = llm.generate([prompt], feedback_params, lora_request=lora_request)
+        return outputs[0].outputs[0].text.strip()
+
+    def get_feedback(entry, proof_text, verification, lora_request=None):
+        """Get feedback using whichever source is configured via --feedback."""
+        prompt = _build_feedback_prompt(entry, proof_text, verification)
+        if feedback == "gemini":
+            return _gemini_generate(prompt)
+        elif feedback == "self":
+            return _vllm_generate(prompt, lora_request=lora_request)
+        return None
 
     def chunked_kl_div(student_logits, teacher_logs_cpu, seq_len, chunk_size=512):
         """Reverse KL(teacher||student) chunked over sequence length to avoid OOM on full vocab tensors."""
@@ -431,11 +458,13 @@ def _distillation(
         all_prompts = [build_student_prompt(entry) for entry in batch]
         t0 = time.time()
         student.save_pretrained(lora_dir)
-        print(f"  [time] lora save: {time.time()-t0:.1f}s", flush=True)
+        t_lora_save = time.time() - t0
+        print(f"  [time] lora save: {t_lora_save:.1f}s", flush=True)
 
         t0 = time.time()
         vllm_outputs = llm.generate(all_prompts, sampling_params, lora_request=LoRARequest("student", epoch + 1, lora_dir))
-        print(f"  [time] vllm generation: {time.time()-t0:.1f}s", flush=True)
+        t_vllm_generation = time.time() - t0
+        print(f"  [time] vllm generation: {t_vllm_generation:.1f}s", flush=True)
 
         # Step 2: Extract proof texts and Lean code
         all_proof_texts, all_lean_codes, all_truncated = [], [], []
@@ -451,20 +480,24 @@ def _distillation(
         print(f"Verifying {len(all_lean_codes) - n_skipped}/{len(all_lean_codes)} proofs ({n_skipped} truncated skipped)...", flush=True)
         t0 = time.time()
         all_verifications = list(verify.starmap(zip(all_lean_codes, all_truncated)))
-        print(f"  [time] verification: {time.time()-t0:.1f}s", flush=True)
+        t_verification = time.time() - t0
+        print(f"  [time] verification: {t_verification:.1f}s", flush=True)
 
-        # Step 4: Per-example Gemini feedback → teacher prompt → KL gradient update
+        # Step 4: Per-example feedback → teacher prompt → KL gradient update
+        lora_request = LoRARequest("student", epoch + 1, lora_dir) if feedback == "self" else None
+        feedback_model_label = GEMINI_MODEL if feedback == "gemini" else model_name if feedback == "self" else None
         for j, (entry, proof_text, verification) in enumerate(zip(batch, all_proof_texts, all_verifications)):
             print(f"Epoch {epoch}, Training {j+1}/{len(batch)} — verify: {verification['status']}", flush=True)
 
-            feedback = t_gemini = None
-            if use_gemini:
-                t0       = time.time()
-                feedback = get_gemini_feedback(entry, proof_text, verification)
-                t_gemini = time.time() - t0
-                print(f"  [time] gemini: {t_gemini:.1f}s | {feedback[:120]}", flush=True)
+            fb_text = None
+            t_feedback = None
+            if feedback != "none":
+                t0         = time.time()
+                fb_text    = get_feedback(entry, proof_text, verification, lora_request=lora_request)
+                t_feedback = time.time() - t0
+                print(f"  [time] feedback ({feedback}, {feedback_model_label}): {t_feedback:.1f}s | {fb_text[:120]}", flush=True)
 
-            teacher_context = build_teacher_prompt(entry, all_prompts[j], verification, feedback=feedback)
+            teacher_context = build_teacher_prompt(entry, all_prompts[j], verification, feedback=fb_text)
             t0 = time.time()
             loss_val, n_tokens, grad_norm = compute_loss_and_update(all_prompts[j], proof_text, teacher_context)
             t_loss = time.time() - t0
@@ -482,11 +515,12 @@ def _distillation(
                 "teacher_context":    teacher_context,
                 "verification_status": verification["status"],
                 "verification_error": verification.get("error"),
-                "gemini_feedback":    feedback,
+                "feedback_text":      fb_text,
+                "feedback_source":    feedback,
                 "kl_divergence":      loss_val,
                 "n_tokens":           n_tokens,
                 "grad_norm":          grad_norm,
-                "timing":             {"gemini": t_gemini, "loss": t_loss},
+                "timing":             {"feedback": t_feedback, "loss": t_loss},
             })
 
         # Step 5: Compute epoch metrics, save log + checkpoint
@@ -510,7 +544,12 @@ def _distillation(
                 "n_pass":          n_pass,
                 "epoch_kl_mean":   epoch_kl_mean,
                 "epoch_kl_total":  epoch_kl_total,
-                "timing":          {"epoch_total": epoch_elapsed},
+                "timing":          {
+                    "epoch_total": epoch_elapsed,
+                    "lora_save": t_lora_save,
+                    "vllm_generation": t_vllm_generation,
+                    "verification": t_verification,
+                },
                 "examples":        epoch_records,
             }, f, indent=2)
         vol.commit()
@@ -554,7 +593,7 @@ def _log_gpu_memory(label: str = ""):
 def main(
     model: str, data_file: str, run_name: str,
     sample_size: int = 0, teacher_model: str = "",
-    use_gemini: bool = True, resume_from: str = "", start_epoch: int = 0,
+    feedback: str = "none", resume_from: str = "", start_epoch: int = 0,
     small_teacher: bool = False, use_compiler_context: bool = True,
 ):
     """
@@ -562,13 +601,18 @@ def main(
       no --teacher-model              → self-distillation       (H100 x2)
       --teacher-model + --small-teacher → co-located teacher    (H100 x2, both on GPU 0)
       --teacher-model                 → large isolated teacher   (H100 x3, teacher on GPU 2)
+
+    --feedback: "gemini" (Gemini API), "self" (student model via vLLM), or "none" (default)
     """
+    if feedback not in ("gemini", "self", "none"):
+        raise ValueError(f"--feedback must be 'gemini', 'self', or 'none', got '{feedback}'")
+
     mode = "(self)" if not teacher_model else f"{teacher_model} ({'small, GPU 0' if small_teacher else 'large, GPU 2'})"
-    print(f"Model: {model} | Teacher: {mode} | Gemini: {use_gemini}", flush=True)
+    print(f"Model: {model} | Teacher: {mode} | Feedback: {feedback}", flush=True)
 
     if teacher_model and small_teacher:
-        distillation_small_teacher.remote(model, data_file, run_name, sample_size, teacher_model, use_gemini, resume_from, start_epoch, use_compiler_context)
+        distillation_small_teacher.remote(model, data_file, run_name, sample_size, teacher_model, feedback, resume_from, start_epoch, use_compiler_context)
     elif teacher_model:
-        distillation_teacher.remote(model, data_file, run_name, sample_size, teacher_model, use_gemini, resume_from, start_epoch, use_compiler_context)
+        distillation_teacher.remote(model, data_file, run_name, sample_size, teacher_model, feedback, resume_from, start_epoch, use_compiler_context)
     else:
-        distillation_self.remote(model, data_file, run_name, sample_size, use_gemini, resume_from, start_epoch, use_compiler_context)
+        distillation_self.remote(model, data_file, run_name, sample_size, feedback, resume_from, start_epoch, use_compiler_context)
